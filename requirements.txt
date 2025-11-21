@@ -1,0 +1,6 @@
+langgraph 
+langchain-google-genai 
+e2b-code-interpreter 
+pydantic
+python-dotenv
+IPython
