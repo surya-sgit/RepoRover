@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from typing import Literal
 from src.state import AgentState
+from langgraph.checkpoint.memory import MemorySaver
 from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c
 
 # --- Mock Nodes (Placeholders for Day 1) ---
@@ -62,6 +63,6 @@ workflow.add_conditional_edges(
     should_continue
 )
 workflow.add_edge("documenter_node", END)
-
+memory = MemorySaver()
 # 4. Compile
-app = workflow.compile()
+app = workflow.compile(checkpointer=memory, interrupt_before=["executor_tool_node"])

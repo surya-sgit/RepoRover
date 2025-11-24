@@ -108,40 +108,49 @@ def call_agent_b(state: AgentState):
 
 def call_executor(state):
     print(state)
-    print("⚙️ EXECUTOR: Running code...")
+    print("⚙️ EXECUTOR: Running code in E2B Sandbox...")
+    
+    # 1. Get the code to run (prioritizing refactored code)
     code_to_run = state.get("refactored_code") or state.get("original_code")
     current_count = state.get("iteration_count", 0)
-    
-    # 1. Capture Stdout (optional, to see print outputs)
-    old_stdout = sys.stdout
-    redirected_output = sys.stdout = StringIO()
-    
-    local_scope = {}
-    
+
+    # 2. Initialize Sandbox (Ephemeral)
+    # Using 'with' ensures the sandbox closes automatically after execution, saving cost.
     try:
-        # 2. EXECUTE WITH ERROR CATCHING
-        exec(code_to_run, {}, local_scope)
-        
-        # If we get here, it worked!
-        sys.stdout = old_stdout
-        print("   -> Execution Successful")
-        
-        return {
-            "execution_status": "SUCCESS", 
-            "execution_logs": "No errors."
-        }
-        
+        with Sandbox() as sbx:
+            # 3. Run the code
+            execution = sbx.run_code(code_to_run)
+
+            # 4. Check for Runtime Errors
+            if execution.error:
+                print(f"   -> Execution Failed: {execution.error.name}")
+                
+                # Combine stderr and the specific error object for context
+                error_details = f"Error: {execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                
+                return {
+                    "execution_status": "FAILURE",
+                    "execution_logs": error_details,
+                    "iteration_count": current_count + 1
+                }
+            
+            # 5. Success Case
+            print("   -> Execution Successful")
+            
+            # Combine stdout into a single string for the logs
+            output_logs = "\n".join(execution.logs.stdout) if execution.logs.stdout else "Code ran successfully with no output."
+            
+            return {
+                "execution_status": "SUCCESS",
+                "execution_logs": output_logs
+            }
+
     except Exception as e:
-        # 3. CATCH THE CRASH
-        sys.stdout = old_stdout # Restore stdout first
-        
-        error_message = f"{type(e).__name__}: {e}"
-        print(f"   -> Execution Failed: {error_message}")
-        
-        # Return FAILURE so the graph can loop back to Agent B
+        # Fallback for connection errors (e.g., API key missing, network issues)
+        print(f"   -> Sandbox Connection Failed: {e}")
         return {
             "execution_status": "FAILURE",
-            "execution_logs": f"{error_message}\nTraceback:\n{traceback.format_exc()}",
+            "execution_logs": f"Infrastructure Error: {str(e)}",
             "iteration_count": current_count + 1
         }
 
