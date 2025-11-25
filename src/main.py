@@ -1,23 +1,50 @@
-from src.graph import app  # Import your compiled graph 'app'
+from src.graph import app 
+from src.github_tools import GitHubConnector
 from dotenv import load_dotenv
 load_dotenv()
 
-## This code looks okay, but it's missing 'import math'
-tricky_code = """
-def calculate_circle_area(radius):
-    return math.pi * (radius ** 2)
-print(f"Area: {calculate_circle_area(5)}")
-"""
+
+# --- CONFIGURATION ---
+# Use a public repo for testing (or your own private one)
+REPO_NAME = "surya-sgit/PortfolioOptimisation" 
+PR_NUMBER = 1 # Pick any closed PR number to test, or create a dummy PR in your own repo
+
+print("--- 1. Connecting to GitHub ---")
+try:
+    gh = GitHubConnector(REPO_NAME)
+    
+    # Fetch real PR data
+    print(f"📥 Fetching PR #{PR_NUMBER}...")
+    pr_data = gh.get_pr_details(PR_NUMBER)
+    
+    # For this demo, we'll focus on the first Python file modified in the PR
+    target_file = None
+    for f in pr_data["files"]:
+        if f["filename"].endswith(".py"):
+            target_file = f
+            break
+            
+    if target_file:
+        full_content = gh.get_file_content(target_file["filename"])
+        
+        initial_state = {
+            "repo_path": REPO_NAME,
+            "file_content": full_content,     # The full file (for Context)
+            "original_code": full_content,
+            "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}", # Intent Analysis
+            "iteration_count": 0
+        }
+        print(f"✅ Loaded: {target_file['filename']}")
+    else:
+        print("❌ No Python files found in this PR.")
+        exit()
+
+except Exception as e:
+    print(f"❌ Connection Failed: {e}")
+    exit()
+
 
 config = {"configurable": {"thread_id": "1"}}
-initial_state = {
-    "repo_path": "./dummy",
-    "file_content": tricky_code,
-    "original_code": tricky_code,
-    "pr_description": "Add circle area calculation",
-    "iteration_count": 0
-}
-
 # Run the graph
 print("🚀 Starting RepoRover with E2B Sandbox...")
 print("\n--- Phase 1: Review & Refactor ---")
