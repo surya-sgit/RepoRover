@@ -4,4 +4,5 @@ e2b-code-interpreter==1.0.3
 pydantic
 python-dotenv
 IPython
+PyGithub
 chainlit
