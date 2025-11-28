@@ -50,16 +50,15 @@ class GitHubConnector:
 
     def get_file_content(self, file_path: str, branch: str = None) -> str:
         """
-        Fetches raw file content. 
-        Used by Agent A to see the *full* file, not just the diff.
+        Fetches raw file content. Raises an error if failed.
         """
         try:
-            # If branch is not specified, use default
             ref = branch if branch else self.repo.default_branch
             contents = self.repo.get_contents(file_path, ref=ref)
             return contents.decoded_content.decode("utf-8")
         except Exception as e:
-            return f"Error reading file {file_path}: {str(e)}"
+            # RAISING the error ensures we never confuse an error message with file content
+            raise ValueError(f"Failed to fetch {file_path} from {ref}: {e}")
 
     def list_files_in_folder(self, folder_path: str) -> List[str]:
         """

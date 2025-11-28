@@ -7,7 +7,6 @@ class AgentState(TypedDict):
     """
     # --- Input Context ---
     repo_path: str
-    file_path: str
     file_content: str
     original_code: str
     pr_description: str

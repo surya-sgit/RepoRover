@@ -29,19 +29,23 @@ def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer
     status = state.get("execution_status")
     count = state.get("iteration_count", 0)
 
+    # 1. SUCCESS -> Document it
     if status == "SUCCESS":
         return "documenter_node"
     
-    # Retry Limit (Max 3 retries)
+    # 2. NEW: USER SKIP -> Document it (even if it failed, we want to record changes)
+    if status == "SKIPPED_TO_DOCS":
+        print("--- User skipped execution. Generating docs... ---")
+        return "documenter_node"
+
+    # 3. FAILURE -> Retry Loop
     if status == "FAILURE" and count < 3:
         print(f"--- FAILED (Attempt {count}). Looping back... ---")
         return "refactorer_node"
     
-    if count >= 3:
-        print("🛑 Max retries reached.")
-        return END
-    
-    return "__end__"
+    # 4. MAX RETRIES or USER END
+    print("🛑 Process Ended.")
+    return END
 
 # --- Graph Construction ---
 workflow = StateGraph(AgentState)

@@ -1,6 +1,7 @@
 import os
 import traceback
 import sys
+import re
 from io import StringIO
 from typing import List
 from pydantic import BaseModel, Field
@@ -33,7 +34,7 @@ llm = ChatGoogleGenerativeAI(
 
 # --- 3. Define the Reviewer Node Function ---
 def call_agent_a(state: AgentState):
-    print(state)
+    # print(state)
     print("--- Agent A: Reviewing Code (Gemini) ---")
     
     code = state["original_code"]
@@ -57,7 +58,7 @@ def call_agent_a(state: AgentState):
 
 
 def call_agent_b(state: AgentState):
-    print(state)
+    # print(state)
     print("--- Agent B: Refactoring Code (Gemini) ---")
     
     code = state.get("refactored_code") or state.get("original_code")
@@ -107,55 +108,64 @@ def call_agent_b(state: AgentState):
     }
 
 def call_executor(state):
-    print(state)
     print("⚙️ EXECUTOR: Running code in E2B Sandbox...")
-    
-    # 1. Get the code to run (prioritizing refactored code)
     code_to_run = state.get("refactored_code") or state.get("original_code")
     current_count = state.get("iteration_count", 0)
 
-    # 2. Initialize Sandbox (Ephemeral)
-    # Using 'with' ensures the sandbox closes automatically after execution, saving cost.
+    # Helper to run code and return result
+    def run_in_sandbox(sbx, code):
+        execution = sbx.run_code(code)
+        if execution.error:
+            return False, execution.error
+        return True, execution.logs.stdout
+
     try:
         with Sandbox() as sbx:
-            # 3. Run the code
-            execution = sbx.run_code(code_to_run)
+            # --- ATTEMPT 1 ---
+            success, result = run_in_sandbox(sbx, code_to_run)
+            
+            # --- AUTO-FIX DEPENDENCIES ---
+            if not success and "ModuleNotFoundError" in result.name:
+                # Extract package name (e.g., "No module named 'numpy'")
+                match = re.search(r"No module named '(\w+)'", result.value)
+                if match:
+                    package_name = match.group(1)
+                    print(f"   📦 Found missing dependency: {package_name}")
+                    print(f"   ⬇️ Installing {package_name}...")
+                    
+                    # Install the package
+                    sbx.commands.run(f"pip install {package_name}")
+                    
+                    # --- ATTEMPT 2 (Retry after install) ---
+                    print("   🔄 Retrying execution...")
+                    success, result = run_in_sandbox(sbx, code_to_run)
 
-            # 4. Check for Runtime Errors
-            if execution.error:
-                print(f"   -> Execution Failed: {execution.error.name}")
-                
-                # Combine stderr and the specific error object for context
-                error_details = f"Error: {execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-                
+            # --- FINAL RESULT HANDLING ---
+            if not success:
+                print(f"   -> Execution Failed: {result.name}")
+                error_details = f"Error: {result.name}: {result.value}\n{result.traceback}"
                 return {
                     "execution_status": "FAILURE",
                     "execution_logs": error_details,
                     "iteration_count": current_count + 1
                 }
             
-            # 5. Success Case
             print("   -> Execution Successful")
-            
-            # Combine stdout into a single string for the logs
-            output_logs = "\n".join(execution.logs.stdout) if execution.logs.stdout else "Code ran successfully with no output."
-            
+            output_logs = "\n".join(result) if result else "Code ran successfully."
             return {
                 "execution_status": "SUCCESS",
                 "execution_logs": output_logs
             }
 
     except Exception as e:
-        # Fallback for connection errors (e.g., API key missing, network issues)
-        print(f"   -> Sandbox Connection Failed: {e}")
+        print(f"   -> Sandbox Infrastructure Error: {e}")
         return {
             "execution_status": "FAILURE",
-            "execution_logs": f"Infrastructure Error: {str(e)}",
+            "execution_logs": str(e),
             "iteration_count": current_count + 1
         }
-
 def call_agent_c(state: AgentState):
-    print(state)
+    # print(state)
     print("--- Agent C: Documenting Changes (Gemini) ---")
     
     original_code = state.get("original_code")
