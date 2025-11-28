@@ -109,11 +109,34 @@ def call_agent_b(state: AgentState):
 
 def call_executor(state):
     print("⚙️ EXECUTOR: Running code in E2B Sandbox...")
+    # 1. Get the code specifically for the file we are fixing
+    target_file = state["file_path"]
+    # If we refactored it, use that. Otherwise use original.
     code_to_run = state.get("refactored_code") or state.get("original_code")
+    
+    # 2. Get the REST of the repo files
+    repo_files = state.get("repo_files", {})
+    
+    # Update the map with our latest refactored code (so imports use the fix!)
+    repo_files[target_file] = code_to_run
+
     current_count = state.get("iteration_count", 0)
 
     # Helper to run code and return result
-    def run_in_sandbox(sbx, code):
+    def run_in_sandbox(sbx, code, repo_files):
+        # --- NEW: HYDRATE SANDBOX FILESYSTEM ---
+        print(f"   💧 Hydrating sandbox with {len(repo_files)} files...")
+        for path, content in repo_files.items():
+            # Handle directories (e.g., src/utils.py needs 'src' folder)
+            directory = os.path.dirname(path)
+            if directory:
+                sbx.commands.run(f"mkdir -p {directory}")
+            
+            # Write the file
+            sbx.files.write(path, content)
+        
+        # --- NOW RUN THE CODE ---
+        # We run the target file specifically
         execution = sbx.run_code(code)
         if execution.error:
             return False, execution.error
@@ -122,7 +145,7 @@ def call_executor(state):
     try:
         with Sandbox() as sbx:
             # --- ATTEMPT 1 ---
-            success, result = run_in_sandbox(sbx, code_to_run)
+            success, result = run_in_sandbox(sbx, code_to_run, repo_files)
             
             # --- AUTO-FIX DEPENDENCIES ---
             if not success and "ModuleNotFoundError" in result.name:
@@ -144,6 +167,7 @@ def call_executor(state):
             if not success:
                 print(f"   -> Execution Failed: {result.name}")
                 error_details = f"Error: {result.name}: {result.value}\n{result.traceback}"
+                print(error_details)
                 return {
                     "execution_status": "FAILURE",
                     "execution_logs": error_details,
@@ -164,6 +188,7 @@ def call_executor(state):
             "execution_logs": str(e),
             "iteration_count": current_count + 1
         }
+
 def call_agent_c(state: AgentState):
     # print(state)
     print("--- Agent C: Documenting Changes (Gemini) ---")
