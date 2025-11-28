@@ -1,25 +1,24 @@
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Dict
 
 class AgentState(TypedDict):
-    """
-    The shared state of the Code Review Graph.
-    Acts as the central memory/blackboard for all agents.
-    """
     # --- Input Context ---
     repo_path: str
     file_path: str
     file_content: str
     original_code: str
     pr_description: str
+    
+    # NEW: Holds the entire relevant file system {"utils.py": "def foo()..."}
+    repo_files: Dict[str, str] 
 
     # --- Agent A Artifacts ---
     intent_summary: str
-    review_issues: List[dict]  # JSON list of issues
+    review_issues: List[dict]
     refactoring_plan: str
 
     # --- Agent B Artifacts ---
     refactored_code: Optional[str]
-    execution_status: str  # "PENDING", "SUCCESS", "FAILURE"
+    execution_status: str
     execution_logs: Optional[str]
     iteration_count: int
     sandbox_session_id: Optional[str]
