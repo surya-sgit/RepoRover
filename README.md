@@ -102,7 +102,7 @@ GOOGLE_API_KEY=your_gemini_api_key_here
 2.  Run the agent:
 
     ```bash
-    python main.py
+    python -m src.main
     ```
 
 3.  **Follow the flow:**
