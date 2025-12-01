@@ -4,25 +4,7 @@ from src.state import AgentState
 from langgraph.checkpoint.memory import MemorySaver
 from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c
 
-# --- Mock Nodes (Placeholders for Day 1) ---
-def reviewer_node(state: AgentState):
-    print("--- Agent A: Reviewing Code ---")
-    return {"review_issues": [{"error": "mock_error"}]}
 
-def refactorer_node(state: AgentState):
-    print("--- Agent B: Refactoring Code ---")
-    return {"refactored_code": "print('hello')", "iteration_count": state.get("iteration_count", 0) + 1}
-
-def executor_tool_node(state: AgentState):
-    print("--- Tool: Executing Code in E2B ---")
-    # Simulate a failure on the first try, success on the second
-    if state.get("iteration_count", 0) < 2:
-        return {"execution_status": "FAILURE", "error_logs": "SyntaxError"}
-    return {"execution_status": "SUCCESS", "error_logs": None}
-
-def documenter_node(state: AgentState):
-    print("--- Agent C: Updating Documentation ---")
-    return {"updated_readme": "Updated content"}
 
 # --- Conditional Logic ---
 def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer_node", "__end__"]:
