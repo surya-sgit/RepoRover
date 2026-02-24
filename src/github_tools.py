@@ -10,7 +10,7 @@ class GitHubConnector:
         """
         token = os.environ.get("GITHUB_TOKEN")
         if not token:
-            raise ValueError("❌ GITHUB_TOKEN not found in environment variables.")
+            raise ValueError("GITHUB_TOKEN not found in environment variables.")
         
         auth = Auth.Token(token)
         self.g = Github(auth=auth)
@@ -18,7 +18,7 @@ class GitHubConnector:
         if repo_name:
             try:
                 self.repo = self.g.get_repo(repo_name)
-                print(f"✅ Connected to: {self.repo.full_name}")
+                print(f"Connected to: {self.repo.full_name}")
             except Exception as e:
                 raise ValueError(f"Could not connect to repo {repo_name}: {e}")
 
@@ -90,7 +90,7 @@ class GitHubConnector:
                         return element.path
             return None
         except Exception as e:
-            print(f"   ⚠️ Search failed for {filename_ending}: {e}")
+            print(f"   Search failed for {filename_ending}: {e}")
             return None
 
     def get_repo_map(self, pr_files: List[dict], branch: str) -> Dict[str, str]:
@@ -101,7 +101,7 @@ class GitHubConnector:
         repo_map = {}
         import ast
 
-        print("📦 Building Repository Map (Hydrating Context)...")
+        print("Building Repository Map (Hydrating Context)...")
         
         # 1. Load files explicitly modified in the PR
         for f in pr_files:
@@ -111,7 +111,7 @@ class GitHubConnector:
                     repo_map[f["filename"]] = content
                     print(f"   Nodes loaded: {f['filename']}")
                 except Exception as e:
-                    print(f"   ⚠️ Failed to load {f['filename']}: {e}")
+                    print(f"   Failed to load {f['filename']}: {e}")
 
         # 2. Scan for missing dependencies (Imports)
         # We look at the content we just fetched to see what else they need
@@ -155,7 +155,7 @@ class GitHubConnector:
                 try:
                     content = self.get_file_content(real_path, branch=branch)
                     repo_map[real_path] = content
-                    print(f"   🔗 Dependency loaded: {real_path}")
+                    print(f"   Dependency loaded: {real_path}")
                 except:
                     pass
         
