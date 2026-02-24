@@ -108,7 +108,7 @@ def call_agent_b(state: AgentState):
     }
 
 def call_executor(state):
-    print("⚙️ EXECUTOR: Running code in E2B Sandbox...")
+    print("EXECUTOR: Running code in E2B Sandbox...")
     # 1. Get the code specifically for the file we are fixing
     target_file = state["file_path"]
     # If we refactored it, use that. Otherwise use original.
@@ -125,7 +125,7 @@ def call_executor(state):
     # Helper to run code and return result
     def run_in_sandbox(sbx, code, repo_files):
         # --- NEW: HYDRATE SANDBOX FILESYSTEM ---
-        print(f"   💧 Hydrating sandbox with {len(repo_files)} files...")
+        print(f"   Hydrating sandbox with {len(repo_files)} files...")
         for path, content in repo_files.items():
             # Handle directories (e.g., src/utils.py needs 'src' folder)
             directory = os.path.dirname(path)
@@ -153,14 +153,14 @@ def call_executor(state):
                 match = re.search(r"No module named '(\w+)'", result.value)
                 if match:
                     package_name = match.group(1)
-                    print(f"   📦 Found missing dependency: {package_name}")
-                    print(f"   ⬇️ Installing {package_name}...")
+                    print(f"   Found missing dependency: {package_name}")
+                    print(f"   Installing {package_name}...")
                     
                     # Install the package
                     sbx.commands.run(f"pip install {package_name}")
                     
                     # --- ATTEMPT 2 (Retry after install) ---
-                    print("   🔄 Retrying execution...")
+                    print("   Retrying execution...")
                     success, result = run_in_sandbox(sbx, code_to_run)
 
             # --- FINAL RESULT HANDLING ---
