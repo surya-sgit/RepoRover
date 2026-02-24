@@ -26,7 +26,7 @@ def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer
         return "refactorer_node"
     
     # 4. MAX RETRIES or USER END
-    print("🛑 Process Ended.")
+    print("Process Ended.")
     return END
 
 # --- Graph Construction ---
