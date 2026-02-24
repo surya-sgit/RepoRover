@@ -15,7 +15,7 @@ try:
     gh = GitHubConnector(REPO_NAME)
     
     # Fetch real PR data
-    print(f"📥 Fetching PR #{PR_NUMBER}...")
+    print(f"Fetching PR #{PR_NUMBER}...")
     pr_data = gh.get_pr_details(PR_NUMBER)
     
     # 1. FETCH EVERYTHING UPFRONT
@@ -23,9 +23,9 @@ try:
     try:
         # Use the new method to get ALL relevant files
         repo_context_map = gh.get_repo_map(pr_data["files"], pr_data["head_branch"])
-        print(f"✅ Hydration Complete. Loaded {len(repo_context_map)} files into memory.")
+        print(f"Hydration Complete. Loaded {len(repo_context_map)} files into memory.")
     except Exception as e:
-        print(f"❌ Failed to hydrate context: {e}")
+        print(f"Failed to hydrate context: {e}")
         exit()
     # 1. Filter for ALL Python files (exclude deleted files)
     target_files = [
@@ -34,36 +34,36 @@ try:
     ]
             
     if not target_files:
-        print("❌ No Python files found in this PR.")
+        print("No Python files found in this PR.")
         sys.exit()
     
-    print(f"📦 Found {len(target_files)} Python files to process.")
+    print(f"Found {len(target_files)} Python files to process.")
 
 except Exception as e:
-    print(f"❌ Connection Failed: {e}")
+    print(f"Connection Failed: {e}")
     sys.exit()
 
 # --- OUTER LOOP: Process Each File Individually ---
-print("🚀 Starting RepoRover with E2B Sandbox...")
+print("Starting RepoRover with E2B Sandbox...")
 
 for i, target_file in enumerate(target_files):
     filename = target_file['filename']
     print(f"\n" + "="*60)
-    print(f"📂 PROCESSING FILE {i+1}/{len(target_files)}: {filename}")
+    print(f"PROCESSING FILE {i+1}/{len(target_files)}: {filename}")
     print("="*60)
 
     # 1. Fetch File Content
     try:
-        print(f"📥 Fetching content from branch: {pr_data['head_branch']}")
+        print(f"Fetching content from branch: {pr_data['head_branch']}")
         # We grab the content from our pre-loaded map
         full_content = repo_context_map.get(filename, "")
         
         if not full_content:
-            print("⚠️ Content missing, fetching fallback...")
+            print("Content missing, fetching fallback...")
             full_content = gh.get_file_content(filename, branch=pr_data["head_branch"])
     except ValueError as e:
-        print(f"⚠️ Error reading {filename}: {e}")
-        print("⏩ Skipping to next file...")
+        print(f"Error reading {filename}: {e}")
+        print("Skipping to next file...")
         continue
 
     # 2. Initialize State for THIS specific file
@@ -100,16 +100,16 @@ for i, target_file in enumerate(target_files):
             print(f"\n=== FINAL OUTPUT for {filename} ===")
             print(f"Review Summary: {final_state.get('intent_summary')}")
             # print(f"Docs: {final_state.get('documentation_diff')}")
-            print(f"✅ Finished processing {filename}.")
+            print(f"Finished processing {filename}.")
             break
 
         # B. IF GRAPH IS PAUSED -> Show Code & Ask Permission
-        print(f"\n🛑 PAUSED: Reviewing changes for {filename}")
+        print(f"\nPAUSED: Reviewing changes for {filename}")
         
         # Check if this is a Retry
         iteration = snapshot.values.get("iteration_count", 0)
         if iteration > 0:
-            print(f"⚠️  (Attempt #{iteration + 1}) Previous run failed or was rejected.")
+            print(f"(Attempt #{iteration + 1}) Previous run failed or was rejected.")
 
         print("--- Proposed Refactored Code (Preview) ---")
         current_code = snapshot.values.get("refactored_code", "No code generated")
@@ -122,11 +122,11 @@ for i, target_file in enumerate(target_files):
         print("-------------------------------")
 
         # 2. Human Decision
-        user_input = input(f"⚠️  Approve execution for {filename}? (y / n / v [view full]): ").strip().lower()
+        user_input = input(f"Approve execution for {filename}? (y / n / v [view full]): ").strip().lower()
 
         # --- OPTION V: VIEW FULL CODE ---
         if user_input == "v":
-            print(f"\n📜 FULL CODE FOR {filename}:")
+            print(f"\nFULL CODE FOR {filename}:")
             print("="*40)
             print(current_code)
             print("="*40 + "\n")
@@ -149,7 +149,7 @@ for i, target_file in enumerate(target_files):
 
         # --- OPTION N: REJECT ---
         else:
-            print("\n❌ Execution Denied. Select an action:")
+            print("\nExecution Denied. Select an action:")
             print("   [1] Give Feedback & Retry (Default)")
             print("   [2] Skip Execution & Generate Docs (Agent C)")
             print("   [3] Force Stop (Exit Program)")
@@ -157,7 +157,7 @@ for i, target_file in enumerate(target_files):
             choice = input("   Enter choice (1/2/3): ").strip()
             
             if choice == "2":
-                print("⏩ Skipping execution. Proceeding to Agent C...")
+                print("Skipping execution. Proceeding to Agent C...")
                 app.update_state(
                     config,
                     {"execution_status": "SKIPPED_TO_DOCS", "execution_logs": "User skipped."},
@@ -169,12 +169,12 @@ for i, target_file in enumerate(target_files):
                 # Loop will restart and catch the "Finished" state
 
             elif choice == "3":
-                print("🛑 Terminating RepoRover.")
+                print("Terminating RepoRover.")
                 sys.exit() 
 
             else:
                 feedback = input("   Reason for rejection: ")
-                print("🔄 Sending feedback to Agent B...")
+                print("Sending feedback to Agent B...")
                 
                 app.update_state(
                     config,
@@ -193,4 +193,4 @@ for i, target_file in enumerate(target_files):
                 
                 # Loop will restart, catch the new Pause, and show you the new code!
 
-print("\n✅ All files processed successfully.")
+print("\nAll files processed successfully.")
