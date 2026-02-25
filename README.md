@@ -1,86 +1,104 @@
-# 🚀 RepoRover: The Autonomous Enterprise Software Engineer
+# RepoRover: Autonomous Enterprise Code Review System
 
-![RepoRover Banner](https://img.shields.io/badge/Status-Prototype-blue) ![Python](https://img.shields.io/badge/Python-3.10%2B-green) ![License](https://img.shields.io/badge/License-MIT-purple)
+![Status](https://img.shields.io/badge/Status-Prototype-blue) ![Python](https://img.shields.io/badge/Python-3.10%2B-green) ![License](https://img.shields.io/badge/License-MIT-purple)
 
-**Your autonomous AI teammate that reviews PRs, fixes bugs, and keeps documentation in sync.**
-
-RepoRover is not just a coding assistant; it is a **multi-agent system** capable of reviewing GitHub Pull Requests, refactoring code, verifying fixes in a secure cloud sandbox (E2B), and updating documentation—all with strict human oversight.
+RepoRover is a multi-agent AI system designed for enterprise-grade Pull Request review, automated code refactoring, sandbox-verified execution, and documentation synchronization — all governed by strict human oversight.
 
 ---
 
-## 🧐 The Problem
-Traditional AI coding tools fail in complex enterprise environments due to two critical issues:
-1.  **The Context Gap:** Agents analyze files in isolation (e.g., `main.py`) without seeing imported dependencies (e.g., `utils.py`), leading to "hallucinated" errors.
-2.  **Lack of Verification:** "Zero-shot" code generation is probabilistic. Without running the code, there is no guarantee it actually works.
+## Table of Contents
 
-## 💡 The Solution: RepoRover
-RepoRover solves this with a **Self-Healing "Think-Code-Run" Loop**.
-* **Dependency Hydration:** Automatically fetches all imported files to build a complete mental model of the codebase.
-* **Secure Sandboxing:** Executes code in an isolated E2B cloud environment to verify fixes.
-* **Auto-Correction:** Catches runtime errors (like `ModuleNotFoundError`) and fixes them autonomously.
+- [Problem Statement](#problem-statement)
+- [Solution Overview](#solution-overview)
+- [Architecture](#architecture)
+- [Key Features](#key-features)
+- [Installation & Setup](#installation--setup)
+- [Usage](#usage)
+- [Technical Stack](#technical-stack)
+- [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
-## 🏗️ Architecture
-RepoRover utilizes **LangGraph** to orchestrate a cyclic workflow between three specialized agents.
+## Problem Statement
 
+Conventional AI coding assistants fall short in complex enterprise environments due to two fundamental limitations:
 
-<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/c408fa64-4929-4673-88b8-0b2d984dde11" />
+1. **Context Isolation:** Agents typically analyze files in isolation (e.g., `main.py`) without access to imported dependencies (e.g., `utils.py`), resulting in incomplete analysis and erroneous suggestions.
+2. **Absence of Verification:** Zero-shot code generation is inherently probabilistic. Without runtime verification, there is no guarantee that generated code is functionally correct.
 
+---
 
+## Solution Overview
 
-## ✨ Key Features
+RepoRover addresses these limitations through a self-healing **Think → Code → Run** feedback loop:
 
-### 1\. 🧠 Dependency Graph Hydration
+- **Dependency Hydration:** Prior to analysis, RepoRover automatically identifies and fetches all imported files to construct a complete representation of the codebase.
+- **Secure Sandboxed Execution:** All generated code is executed within an isolated E2B cloud environment for runtime verification before any changes are proposed to the user.
+- **Autonomous Error Correction:** Runtime failures (e.g., `ModuleNotFoundError`) are detected and remediated automatically, without requiring human intervention.
 
-Before touching a single line of code, RepoRover scans the Abstract Syntax Tree (AST) of the target file to identify imports. It then recursively crawls the GitHub repository to fetch all necessary dependency files, ensuring the agent has full context.
+---
 
-### 2\. 🛡️ E2B Sandbox Integration
+## Architecture
 
-Instead of unsafe local execution, RepoRover spins up a pristine Linux environment for every PR.
+RepoRover is orchestrated via **LangGraph**, coordinating a cyclic workflow across three specialized agents.
 
-  * **Environment Mirroring:** Replicates the repo structure in the cloud.
-  * **Self-Healing:** If a script fails due to missing libraries, the agent autonomously runs `pip install` and retries.
+<img width="1024" height="559" alt="RepoRover Architecture Diagram" src="https://github.com/user-attachments/assets/c408fa64-4929-4673-88b8-0b2d984dde11" />
 
-### 3\. 🚦 Human-in-the-Loop Safety
+---
 
-AI never merges code without permission. Before execution, the system pauses and presents the proposed fix.
+## Key Features
 
-  * **Approve:** Proceed to execution and documentation.
-  * **Reject with Feedback:** "You missed an edge case." -\> Agent B retries.
-  * **Skip:** Bypass execution but generate docs.
+### 1. Dependency Graph Hydration
 
-### 4\. 📝 Diff-Driven Documentation
+Before modifying any code, RepoRover performs a static analysis of the target file's Abstract Syntax Tree (AST) to identify all import statements. It then recursively fetches the corresponding files from the GitHub repository, ensuring the agent operates with complete contextual awareness.
 
-Agent C (The Documenter) only runs after the code is **verified**. It analyzes the semantic changes and updates the `README.md` or docstrings, ensuring documentation never drifts from reality.
+### 2. E2B Sandbox Integration
 
------
+Code execution is performed exclusively within a secure, ephemeral E2B cloud environment — never on the host machine.
 
-## 🛠️ Installation & Setup
+- **Environment Mirroring:** The repository structure is replicated within the sandbox to accurately simulate the production environment.
+- **Self-Healing Execution:** If execution fails due to missing dependencies, the system autonomously installs the required packages and retries without human intervention.
+
+### 3. Human-in-the-Loop Approval
+
+No code is merged or applied without explicit human authorization. Upon generating a proposed fix, the system pauses and presents the changes for review. The reviewer may:
+
+- **Approve** — Proceed to sandboxed execution and documentation generation.
+- **Reject with Feedback** — Provide a reason for rejection; the agent will incorporate the feedback and regenerate the fix.
+- **Skip Execution** — Bypass sandboxed execution and proceed directly to documentation generation.
+
+### 4. Diff-Driven Documentation
+
+Documentation is updated only after code changes have been verified through successful sandbox execution. Agent C (the Documenter) performs a semantic analysis of the applied changes and updates the relevant `README.md` sections or inline docstrings accordingly, ensuring documentation remains consistent with the codebase at all times.
+
+---
+
+## Installation & Setup
 
 ### Prerequisites
 
-  * Python 3.10+
-  * GitHub Account (and Personal Access Token)
-  * [E2B](https://e2b.dev/) Account
-  * Google Gemini API Key
+- Python 3.10 or higher
+- A GitHub account with a valid Personal Access Token
+- An [E2B](https://e2b.dev/) account and API key
+- A Google Gemini API key
 
-### 1\. Clone the Repository
+### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/yourusername/reporover.git](https://github.com/yourusername/reporover.git)
+git clone https://github.com/yourusername/reporover.git
 cd reporover
 ```
 
-### 2\. Install Dependencies
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3\. Configure Environment
+### 3. Configure Environment Variables
 
-Create a `.env` file in the root directory:
+Create a `.env` file in the project root directory with the following contents:
 
 ```env
 GITHUB_TOKEN=ghp_your_github_token_here
@@ -88,51 +106,52 @@ E2B_API_KEY=e2b_your_api_key_here
 GOOGLE_API_KEY=your_gemini_api_key_here
 ```
 
------
+---
 
-## 🚀 Usage
+## Usage
 
-1.  Open `main.py` and configure the target repository and PR number you want to review:
+1. Open `main.py` and specify the target repository and Pull Request number:
 
     ```python
-    REPO_NAME = "owner/repository-name" 
-    PR_NUMBER = 1 
+    REPO_NAME = "owner/repository-name"
+    PR_NUMBER = 1
     ```
 
-2.  Run the agent:
+2. Execute the agent:
 
     ```bash
     python -m src.main
     ```
 
-3.  **Follow the flow:**
+3. Follow the interactive review process:
 
-      * The agent will hydrate the context and propose a fix.
-      * Review the code preview in the console.
-      * Type `y` to approve, `n` to reject/provide feedback, or `v` to view the full code.
+    - The agent will hydrate the dependency context and propose a refactored solution.
+    - A preview of the proposed changes will be displayed in the console.
+    - Enter `y` to approve, `n` to reject and provide feedback, or `v` to view the complete code.
 
------
+---
 
-## 📚 Technical Stack
+## Technical Stack
 
-  * **Orchestration:** [LangGraph](https://github.com/langchain-ai/langgraph) (Cyclic State Management)
-  * **LLM:** Google Gemini 2.0 Flash (Reasoning & Code Gen)
-  * **Sandbox:** [E2B Code Interpreter](https://e2b.dev/) (Secure Execution)
-  * **Data:** [PyGithub](https://github.com/PyGithub/PyGithub) (Repository Interaction)
+| Component | Technology |
+|---|---|
+| Agent Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) — Cyclic State Management |
+| Language Model | Google Gemini 2.0 Flash — Reasoning & Code Generation |
+| Execution Sandbox | [E2B Code Interpreter](https://e2b.dev/) — Secure Cloud Execution |
+| Repository Access | [PyGithub](https://github.com/PyGithub/PyGithub) — GitHub API Integration |
 
------
+---
 
-## 🔮 Future Roadmap
+## Roadmap
 
-  - [ ] **Multi-Language Support:** Extend E2B sandbox for Node.js/TypeScript.
-  - [ ] **Vector Database (RAG):** Replace AST parsing with semantic search for massive monorepos.
-  - [ ] **GitHub App:** Package as an installed bot that comments directly on PRs.
+| Priority | Feature | Description |
+|---|---|---|
+| Medium | Multi-Language Support | Extend sandbox capabilities to support Node.js and TypeScript projects |
+| Medium | Semantic Search via RAG | Replace AST-based parsing with vector database retrieval for large monorepos |
+| High | GitHub App Integration | Package RepoRover as an installable GitHub App that comments directly on Pull Requests |
 
------
+---
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
-
-```
-```
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
