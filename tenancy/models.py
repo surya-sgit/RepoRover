@@ -6,43 +6,73 @@ stored here — only tenant config, encrypted BYOK keys, and review-session
 metadata.
 """
 from __future__ import annotations
-
 import uuid
-
 from django.db import models
-
 from .crypto import decrypt_key, encrypt_key
 
-
 class OrganizationConfig(models.Model):
-    """Top-level tenant authorization, created when a user installs the GitHub App."""
+    """Top-level tenant authorization with multi-LLM provider support (PRD §3.1, §4.1)."""
+
+    class ProviderChoices(models.TextChoices):
+        GEMINI = "gemini", "Google Gemini"
+        OPENAI = "openai", "OpenAI"
+        GROQ = "groq", "Groq"
+        LOCAL = "local", "Local Setup / Ollama"
 
     github_installation_id = models.IntegerField(
         unique=True,
         help_text="Unique installation id supplied by GitHub during app setup.",
     )
-    # AES-encrypted BYOK parameters (PRD §3.1, §4.1). Never store plaintext.
-    encrypted_gemini_key = models.BinaryField(null=True, blank=True)
+    
+    # Provider Settings
+    llm_provider = models.CharField(
+        max_length=20,
+        choices=ProviderChoices.choices,
+        default=ProviderChoices.GEMINI,
+        help_text="Active LLM provider for processing reviews."
+    )
+    llm_model_name = models.CharField(
+        max_length=100,
+        default="gemini-2.5-flash",
+        help_text="Target model execution string (e.g., llama3-70b-8192, gpt-4o, etc.)"
+    )
+    llm_base_url = models.URLField(
+        null=True,
+        blank=True,
+        help_text="Custom endpoint wrapper URL (Required for Local Ollama, e.g., http://localhost:11434/v1)"
+    )
+
+    # Generic Encrypted Key Vault
+    encrypted_llm_key = models.BinaryField(
+        null=True, 
+        blank=True, 
+        help_text="AES-encrypted API key string matching the selected provider."
+    )
     encrypted_e2b_key = models.BinaryField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def set_gemini_key(self, plaintext: str) -> None:
-        self.encrypted_gemini_key = encrypt_key(plaintext)
+    def set_llm_key(self, plaintext: str) -> None:
+        self.encrypted_llm_key = encrypt_key(plaintext)
 
     def set_e2b_key(self, plaintext: str) -> None:
         self.encrypted_e2b_key = encrypt_key(plaintext)
 
-    def get_gemini_key(self) -> str:
-        """Decrypt the Gemini key. Call only inside a worker, never log the result."""
-        return decrypt_key(self.encrypted_gemini_key)
+    def get_llm_key(self) -> str:
+        if not self.encrypted_llm_key:
+            return ""
+        return decrypt_key(self.encrypted_llm_key)
 
     def get_e2b_key(self) -> str:
-        """Decrypt the E2B key. Call only inside a worker, never log the result."""
+        if not self.encrypted_e2b_key:
+            return ""
         return decrypt_key(self.encrypted_e2b_key)
 
     @property
     def has_keys(self) -> bool:
-        return bool(self.encrypted_gemini_key and self.encrypted_e2b_key)
+        # Local loops like Ollama do not require an API key string to execute
+        if self.llm_provider == self.ProviderChoices.LOCAL:
+            return bool(self.encrypted_e2b_key)
+        return bool(self.encrypted_llm_key and self.encrypted_e2b_key)
 
     def __str__(self) -> str:
         return f"OrganizationConfig(installation={self.github_installation_id})"

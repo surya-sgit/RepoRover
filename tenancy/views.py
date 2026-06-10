@@ -7,7 +7,7 @@ from these DB records only — never from files inside a PR (PRD §6.1).
 from __future__ import annotations
 
 import secrets
-
+from django import forms
 from django.conf import settings
 from django.contrib import messages
 from django.http import HttpResponseForbidden
@@ -15,8 +15,10 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 
 from . import github_oauth
-from .forms import ByokKeyForm, RepoSettingsForm
+from .forms import ByokKeyForm, RepoSettingsForm, OrganizationConfigForm
+from django.contrib.auth.decorators import login_required
 from .models import OrganizationConfig, RepoSettings
+
 
 SESSION_TOKEN = "gh_oauth_token"
 SESSION_LOGIN = "gh_login"
@@ -92,6 +94,26 @@ def _authorize_org(request, org: OrganizationConfig):
     allowed = set(request.session.get(SESSION_INSTALLS, []))
     return org.github_installation_id in allowed
 
+class DynamicConfigForm(forms.ModelForm):
+    llm_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(attrs={"placeholder": "Leave blank to keep existing key"}),
+        label="LLM API Key"
+    )
+    e2b_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(attrs={"placeholder": "Leave blank to keep existing key"}),
+        label="E2B Sandbox API Key"
+    )
+
+    class Meta:
+        model = OrganizationConfig
+        fields = ["llm_provider", "llm_model_name", "llm_base_url"]
+        labels = {
+            "llm_provider": "LLM Provider",
+            "llm_model_name": "Target Model Name",
+            "llm_base_url": "Base URL (Optional)",
+        }
 
 def org_keys(request, org_id: int):
     if not _require_login(request):
@@ -101,22 +123,29 @@ def org_keys(request, org_id: int):
         return HttpResponseForbidden("Not authorized for this installation")
 
     if request.method == "POST":
-        form = ByokKeyForm(request.POST)
+        form = DynamicConfigForm(request.POST)
         if form.is_valid():
-            gem = form.cleaned_data["gemini_api_key"]
-            e2b = form.cleaned_data["e2b_api_key"]
-            if gem:
-                org.set_gemini_key(gem)
-            if e2b:
-                org.set_e2b_key(e2b)
+            org.llm_provider = form.cleaned_data.get("llm_provider")
+            org.llm_model_name = form.cleaned_data.get("llm_model_name")
+            org.llm_base_url = form.cleaned_data.get("llm_base_url") or ""
+            
+            llm_key = form.cleaned_data.get("llm_key")
+            e2b_key = form.cleaned_data.get("e2b_key")
+
+            if llm_key and llm_key.strip():
+                org.set_llm_key(llm_key.strip())
+            if e2b_key and e2b_key.strip():
+                org.set_e2b_key(e2b_key.strip())
+                
             org.save()
-            messages.success(request, "Keys saved (encrypted).")
+            
+            # Fix redirect target to prevent loop drop-outs
             return redirect("tenancy:dashboard")
+            
     else:
-        form = ByokKeyForm()
+        form = DynamicConfigForm(instance=org)
 
     return render(request, "tenancy/org_keys.html", {"org": org, "form": form})
-
 
 def repo_settings(request, org_id: int):
     if not _require_login(request):

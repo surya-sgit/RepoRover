@@ -1,7 +1,33 @@
 from django import forms
 
-from .models import RepoSettings
+from .models import RepoSettings, OrganizationConfig
 
+class OrganizationConfigForm(forms.ModelForm):
+    # Overwrite fields with explicit password text masking for keys
+    llm_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(attrs={"placeholder": "Leave blank to keep existing key"}),
+        label="LLM API Key"
+    )
+    e2b_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(attrs={"placeholder": "Leave blank to keep existing key"}),
+        label="E2B Sandbox API Key"
+    )
+
+    class Meta:
+        model = OrganizationConfig
+        fields = ["llm_provider", "llm_model_name", "llm_base_url"]
+        labels = {
+            "llm_provider": "LLM Provider",
+            "llm_model_name": "Target Model Name",
+            "llm_base_url": "Base URL (Optional)",
+        }
+        widgets = {
+            "llm_provider": forms.Select(attrs={"style": "width: 100%; padding: 8px;"}),
+            "llm_model_name": forms.TextInput(attrs={"style": "width: 100%; padding: 8px;", "placeholder": "e.g., gpt-4o, llama3-70b-8192"}),
+            "llm_base_url": forms.TextInput(attrs={"style": "width: 100%; padding: 8px;", "placeholder": "e.g., http://localhost:11434/v1"}),
+        }
 
 class ByokKeyForm(forms.Form):
     """Submit BYOK secrets. Values are encrypted before storage; never rendered back."""

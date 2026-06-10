@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from src.state import AgentState
 from e2b_code_interpreter import Sandbox
@@ -33,16 +34,74 @@ def _configurable(config) -> dict:
     return {}
 
 
-def _build_llm(config) -> ChatGoogleGenerativeAI:
+def _build_llm(config):
+    """
+    Dynamically resolves or builds a LangChain ChatModel instance.
+    1. Checks for a pre-instantiated model instance under config['configurable']['llm'].
+    2. Falls back to generating an instance from explicit runtime parameters.
+    3. Drops back to standard provider environment keys for local smoke testing.
+    """
     cfg = _configurable(config)
-    api_key = cfg.get("gemini_api_key") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("No Gemini API key available (tenant BYOK missing).")
-    return ChatGoogleGenerativeAI(
-        model=cfg.get("gemini_model", "gemini-2.5-flash"),
-        temperature=0,  # Low temperature for strict analysis
-        api_key=api_key,
-    )
+    
+    # Priority 1: Direct injection of an initialized LangChain BaseChatModel object
+    if "llm" in cfg and cfg["llm"] is not None:
+        return cfg["llm"]
+        
+    # Priority 2: Extract orchestration fields to build on the fly
+    provider = str(cfg.get("llm_provider", "gemini")).lower()
+    model_name = cfg.get("llm_model_name") or cfg.get("gemini_model")
+    
+    if provider == "gemini":
+        api_key = cfg.get("llm_key") or cfg.get("gemini_api_key") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("No Gemini API key available (tenant BYOK missing).")
+        return ChatGoogleGenerativeAI(
+            model=model_name or "gemini-2.5-flash",
+            temperature=0,
+            api_key=api_key,
+        )
+        
+    elif provider == "openai":
+        api_key = cfg.get("llm_key") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("No OpenAI API key available.")
+        return ChatOpenAI(
+            model=model_name or "gpt-4o-mini",
+            temperature=0,
+            api_key=api_key,
+        )
+        
+    elif provider == "groq":
+        api_key = cfg.get("llm_key") or os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("No Groq API key available.")
+        return ChatOpenAI(
+            model=model_name or "llama3-70b-8192",
+            temperature=0,
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        
+    elif provider in ["local", "ollama"]:
+        base_url = cfg.get("llm_base_url") or os.environ.get("LOCAL_LLM_BASE_URL") or "http://localhost:11434/v1"
+        return ChatOpenAI(
+            model=model_name or "llama3",
+            temperature=0,
+            api_key="local-placeholder",  # Bypasses internal client validations
+            base_url=base_url,
+        )
+        
+    else:
+        # Open routing loop for general OpenAI-compatible endpoints
+        base_url = cfg.get("llm_base_url")
+        if base_url:
+            return ChatOpenAI(
+                model=model_name or "custom-model",
+                temperature=0,
+                api_key=cfg.get("llm_key", "placeholder"),
+                base_url=base_url,
+            )
+        raise ValueError(f"Unsupported or unconfigured LLM provider configuration: {provider}")
 
 
 def _e2b_api_key(config) -> Optional[str]:
@@ -51,13 +110,13 @@ def _e2b_api_key(config) -> Optional[str]:
 
 # --- 3. Agent A: Reviewer ---
 def call_agent_a(state: AgentState, config=None):
-    print("--- Agent A: Reviewing Code (Gemini) ---")
+    llm = _build_llm(config)
+    print(f"--- Agent A: Reviewing Code ({llm.__class__.__name__}) ---")
 
     code = state["original_code"]
 
-    # Force structured JSON output so raw commit text never reaches a high-trust
-    # free-form prompt (prompt-injection neutralization, PRD §6.2).
-    structured_llm = _build_llm(config).with_structured_output(ReviewOutput)
+    # Native schema mapping enforced through the unified interface wrapper
+    structured_llm = llm.with_structured_output(ReviewOutput)
 
     system_prompt = """You are a Principal Software Architect.
     Analyze the provided code for logic errors, security vulnerabilities, and code style issues.
@@ -74,7 +133,8 @@ def call_agent_a(state: AgentState, config=None):
 
 # --- 4. Agent B: Refactorer ---
 def call_agent_b(state: AgentState, config=None):
-    print("--- Agent B: Refactoring Code (Gemini) ---")
+    llm = _build_llm(config)
+    print(f"--- Agent B: Refactoring Code ({llm.__class__.__name__}) ---")
 
     code = state.get("refactored_code") or state.get("original_code")
     issues = state.get("review_issues", [])
@@ -97,11 +157,23 @@ def call_agent_b(state: AgentState, config=None):
     INSTRUCTIONS:
     - If there are Runtime Errors, you MUST fix the code to resolve them.
     - Specifically check for missing imports (like 'math') or syntax errors.
-    - Return ONLY the fixed code. No markdown, no conversational text.
     - If the code is perfect and there are no errors, return the string "NO_CHANGES".
+    !IMPORTANT!
+    - Generate a unified code diff comparison.
+    - Use a standard git diff markdown block format starting with ```diff.
+    - Mark removed lines with a leading '-' and added lines with a leading '+'.
+
+    Example Output format:
+    ```diff
+    def compute_risk_factor(base_score, multiplier):
+    -     final_index = base_score / multiplier
+    +     if multiplier == 0:
+    +         return 0
+    +     final_index = base_score / multiplier
+    ```
     """
 
-    response = _build_llm(config).invoke([HumanMessage(content=prompt)])
+    response = llm.invoke([HumanMessage(content=prompt)])
     result_code = response.content.strip()
 
     # Strip markdown fences if the model adds them.
@@ -195,7 +267,8 @@ def call_executor(state: AgentState, config=None):
 
 # --- 6. Agent C: Documenter ---
 def call_agent_c(state: AgentState, config=None):
-    print("--- Agent C: Documenting Changes (Gemini) ---")
+    llm = _build_llm(config)
+    print(f"--- Agent C: Documenting Changes ({llm.__class__.__name__}) ---")
 
     original_code = state.get("original_code")
     refactored_code = state.get("refactored_code")
@@ -214,7 +287,7 @@ def call_agent_c(state: AgentState, config=None):
     2. Return ONLY the Markdown documentation.
     """
 
-    response = _build_llm(config).invoke([HumanMessage(content=prompt)])
+    response = llm.invoke([HumanMessage(content=prompt)])
     doc_update = response.content.strip()
 
     return {

@@ -12,8 +12,56 @@ from django.conf import settings
 
 from src.github_tools import GitHubConnector
 from tenancy.models import OrganizationConfig, RepoSettings, ReviewSession
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-
+def get_tenant_llm(org: OrganizationConfig):
+    """
+    Dynamic factory initializing any cloud provider or local pipeline 
+    conforming to OpenAI or Google GenAI standard schemas.
+    """
+    api_key = org.get_llm_key()
+    model_name = org.llm_model_name
+    
+    # 1. Google Gemini Route
+    if org.llm_provider == OrganizationConfig.ProviderChoices.GEMINI:
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0.1
+        )
+        
+    # 2. OpenAI Native Route
+    elif org.llm_provider == OrganizationConfig.ProviderChoices.OPENAI:
+        return ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            temperature=0.1
+        )
+        
+    # 3. Groq Infrastructure Route
+    elif org.llm_provider == OrganizationConfig.ProviderChoices.GROQ:
+        return ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            temperature=0.1
+        )
+        
+    # 4. Local Setup / Ollama Route
+    elif org.llm_provider == OrganizationConfig.ProviderChoices.LOCAL:
+        # Default local setups fall back to standard local host loops if blank
+        base_url = org.llm_base_url or "http://localhost:11434/v1"
+        return ChatOpenAI(
+            model=model_name,
+            api_key="local-placeholder",  # Ollama requires a non-empty key placeholder
+            base_url=base_url,
+            temperature=0.1
+        )
+        
+    else:
+        raise ValueError(f"Unsupported model provider: {org.llm_provider}")
+    
 def resolve_tenant(
     installation_id: int, repo_full_name: str
 ) -> Tuple[Optional[OrganizationConfig], Optional[RepoSettings]]:
@@ -52,21 +100,27 @@ def build_connector(org: OrganizationConfig, repo: RepoSettings) -> GitHubConnec
     )
 
 
-def tenant_runtime_config(org: OrganizationConfig, thread_id: str) -> dict:
-    """Build the LangGraph ``configurable`` dict, decrypting BYOK keys in-memory.
-
-    The plaintext keys live only for the duration of the task and are passed
-    through ``configurable`` (not persisted state), so they never enter the
-    checkpoint store (PRD §3.1, §1).
+def tenant_runtime_config(org, thread_id):
+    """
+    Builds the state dictionary metadata configuration that LangGraph 
+    injects directly into the agent node executors context loop (PRD §3.1).
     """
     return {
         "configurable": {
             "thread_id": thread_id,
-            "gemini_api_key": org.get_gemini_key(),
-            "e2b_api_key": org.get_e2b_key(),
+            
+            # --- FIXED FIELDS FOR THE MULTI-LLM PIPELINE ---
+            "llm_provider": org.llm_provider,
+            "llm_model_name": org.llm_model_name,
+            "llm_base_url": org.llm_base_url,
+            "llm_key": org.get_llm_key(),       # Resolves any active provider key cleanly
+            "e2b_api_key": org.get_e2b_key(),   # Resolves sandbox execution credentials
+            
+            # Legacy fallback strings to maintain structural compatibility with other components
+            "gemini_api_key": org.get_llm_key(),
+            "gemini_model": org.llm_model_name,
         }
     }
-
 
 def select_target_file(pr_data: dict) -> Optional[dict]:
     """Pick the changed Python file to review.

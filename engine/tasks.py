@@ -96,7 +96,7 @@ def _start_review(session: ReviewSession, org, repo):
         content = repo_map.get(filename) or gh.get_file_content(
             filename, branch=pr_data["head_branch"]
         )
-
+        llm_instance = services.get_tenant_llm(org)
         thread_id = str(session.langgraph_thread_id)
         config = services.tenant_runtime_config(org, thread_id)
         initial_state = {
@@ -108,7 +108,7 @@ def _start_review(session: ReviewSession, org, repo):
             "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
             "iteration_count": 0,
         }
-
+        config["configurable"]["llm"] = llm_instance
         app = get_app()
         # Runs reviewer -> refactorer, then pauses before executor_tool_node.
         for _ in app.stream(initial_state, config=config):
