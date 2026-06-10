@@ -75,28 +75,79 @@ WSGI_APPLICATION = "reporover.wsgi.application"
 ASGI_APPLICATION = "reporover.asgi.application"
 
 # --- Database (PostgreSQL per PRD §4) ---
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": env("POSTGRES_DB", "reporover"),
-        "USER": env("POSTGRES_USER", "reporover"),
-        "PASSWORD": env("POSTGRES_PASSWORD", "reporover"),
-        "HOST": env("POSTGRES_HOST", "localhost"),
-        "PORT": env("POSTGRES_PORT", "5432"),
-    }
-}
+from urllib.parse import urlparse, unquote, quote
 
-# DSN reused by the LangGraph PostgresSaver checkpointer (engine layer).
-POSTGRES_DSN = env(
-    "POSTGRES_DSN",
-    "postgresql://{user}:{password}@{host}:{port}/{name}".format(
+postgres_dsn_env = env("POSTGRES_DSN")
+
+if postgres_dsn_env:
+    dsn_clean = postgres_dsn_env
+    if dsn_clean.startswith("postgresql://"):
+        body = dsn_clean[len("postgresql://"):]
+        scheme = "postgresql"
+    elif dsn_clean.startswith("postgres://"):
+        body = dsn_clean[len("postgres://"):]
+        scheme = "postgres"
+    else:
+        body = dsn_clean
+        scheme = "postgresql"
+
+    # Always split on the rightmost '@' to safely isolate host info first
+    credentials, separator, host_info = body.rpartition("@")
+    
+    if separator:
+        user, _, password = credentials.partition(":")
+        host_port, _, db_name = host_info.partition("/")
+        host, _, port = host_port.partition(":")
+        
+        # Normalize: Convert any potential %40 back to literal '@' for Django
+        literal_user = unquote(user)
+        literal_password = unquote(password)
+        
+        # 1. Populate Django with the literal, unquoted values it expects
+        DATABASES = {
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": db_name,
+                "USER": literal_user,
+                "PASSWORD": literal_password,
+                "HOST": host,
+                "PORT": port if port else "5432",
+                "OPTIONS": {
+                    "sslmode": "prefer",  # Secure handshake alignment for managed cloud DBs
+                },
+            }
+        }
+        
+        # 2. Re-encode the password strictly to ensure Celery/LangGraph/psycopg 
+        # never see a raw '@' character that triggers host resolution crashes.
+        encoded_password = quote(literal_password)
+        POSTGRES_DSN = f"{scheme}://{literal_user}:{encoded_password}@{host_info}"
+        os.environ["POSTGRES_DSN"] = POSTGRES_DSN
+        
+    else:
+        raise RuntimeError("Invalid or malformed POSTGRES_DSN string found in environment parameters.")
+else:
+    # Fallback to individual local environment variables if DSN is missing
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": env("POSTGRES_DB", "reporover"),
+            "USER": env("POSTGRES_USER", "reporover"),
+            "PASSWORD": env("POSTGRES_PASSWORD", "reporover"),
+            "HOST": env("POSTGRES_HOST", "localhost"),
+            "PORT": env("POSTGRES_PORT", "5432"),
+            "OPTIONS": {
+                "sslmode": "prefer",
+            },
+        }
+    }
+    POSTGRES_DSN = "postgresql://{user}:{password}@{host}:{port}/{name}".format(
         user=DATABASES["default"]["USER"],
         password=DATABASES["default"]["PASSWORD"],
         host=DATABASES["default"]["HOST"],
         port=DATABASES["default"]["PORT"],
         name=DATABASES["default"]["NAME"],
-    ),
-)
+    )
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
@@ -115,6 +166,22 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_DEFAULT_QUEUE = "reporover"
+# --- Celery / Redis Security Overrides ---
+# Tells Celery to allow connection loops over cloud TLS links
+CELERY_BROKER_USE_SSL = {
+    'ssl_cert_reqs': None
+}
+CELERY_REDIS_BACKEND_USE_SSL = {
+    'ssl_cert_reqs': None
+}
+
+# Upstash drops idle connections quickly to save serverless resources.
+# This keeps sockets alive by actively heartbeating every 10 seconds.
+CELERY_REDIS_BROKER_TRANSPORT_OPTIONS = {
+    'socket_timeout': 30,
+    'socket_keepalive': True,
+    'retry_on_timeout': True
+}
 
 # --- BYOK encryption (PRD §3.1) ---
 # Master Fernet key (AES-256) used to encrypt tenant Gemini/E2B keys at rest.

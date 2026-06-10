@@ -145,6 +145,32 @@ def handle_issue_comment(self, payload: dict):
     if not org or not repo:
         return
 
+    gh = services.build_connector(org, repo)
+
+    # ───────────────────────────────────────────────────────────────────
+    # INTERCEPT AUTOMATED FRESH REVIEW TRIGGER
+    # ───────────────────────────────────────────────────────────────────
+    if cmd.command == "review":
+        if services.at_capacity(repo):
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at its concurrency capacity loop limit.")
+            return
+
+        latest_sha = gh.get_latest_commit_sha(pr_number)
+        
+        # Spawn an entirely new review session record mapping the current head state
+        session = ReviewSession.objects.create(
+            repo_settings=repo,
+            pr_number=pr_number,
+            commit_sha=latest_sha,
+            current_status=ReviewSession.Status.ANALYZING,
+            active_jobs=1,
+        )
+        
+        _start_review(session, org, repo)
+        return
+    # ───────────────────────────────────────────────────────────────────
+
+    # The existing lookups for AWAITING_HUMAN continue safely down here...
     session = (
         ReviewSession.objects.filter(
             repo_settings=repo,

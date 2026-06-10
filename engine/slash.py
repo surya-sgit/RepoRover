@@ -7,7 +7,8 @@ from typing import Optional
 APPROVE = "approve"
 REJECT = "reject"
 SKIP = "skip"
-VALID_COMMANDS = (APPROVE, REJECT, SKIP)
+REVIEW = "review"
+VALID_COMMANDS = (APPROVE, REJECT, SKIP, REVIEW)
 
 
 @dataclass

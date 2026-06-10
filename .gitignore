@@ -2,5 +2,6 @@ venv
 venv/*
 .env
 src/__pycache__/*
-/__pycache__/*
+**/__pycache__/
 /.chainlit/
+*.pyc
