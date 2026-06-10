@@ -131,14 +131,62 @@ GOOGLE_API_KEY=your_gemini_api_key_here
 
 ---
 
+## Running the Phase 1.0 SaaS Platform (Local)
+
+Phase 1.0 runs RepoRover as a multi-tenant GitHub App: a Django web service
+ingests webhooks, Celery workers run the LangGraph agent loop, and all
+interaction happens inside PR comments via slash commands. The single-PR CLI in
+`src/main.py` remains only as a developer smoke test.
+
+### Prerequisites
+
+- Python 3.10+, PostgreSQL, and Redis running locally
+- A registered **GitHub App** (with webhook URL, a webhook secret, a private
+  key, and OAuth client credentials) plus per-tenant Gemini and E2B keys (BYOK)
+
+### Setup
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then fill in every value
+# Generate the BYOK master key and paste it into FERNET_KEY:
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python manage.py migrate
+```
+
+### Run the stack (separate terminals)
+
+```bash
+python manage.py runserver 8000             # Django web + webhook intake
+celery -A reporover worker -l info          # agent execution workers
+ngrok http 8000                             # public tunnel for GitHub webhooks
+```
+
+Point your GitHub App's **Webhook URL** at `https://<ngrok-id>.ngrok-free.app/webhooks/github/`
+and its **Setup/Callback URL** at `/dashboard/setup/`. Visit
+`http://localhost:8000/dashboard/` to log in with GitHub and store your BYOK keys
+and per-repo settings.
+
+### The review loop
+
+1. Open or update a PR with a Python change → RepoRover posts a review + proposed
+   patch and pauses.
+2. Reply in the PR with a slash command:
+   - `/approve` — run the fix in the E2B sandbox (self-heals missing deps, ≤3 tries), then document it.
+   - `/reject <feedback>` — send feedback to the refactorer for a new attempt.
+   - `/skip` — skip the sandbox and generate documentation directly.
+
 ## Technical Stack
 
 | Component | Technology |
 |---|---|
+| SaaS Framework & Web API | Django 5.x — Webhook intake, OAuth dashboard, multi-tenant config |
+| Task Queue & Routing | Celery 5.x + Redis — Non-blocking agent execution, concurrency limits |
 | Agent Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) — Cyclic State Management |
-| Language Model | Google Gemini 2.0 Flash — Reasoning & Code Generation |
+| Persistence | PostgreSQL — Tenant config, encrypted BYOK vault, session state |
+| Language Model | Google Gemini 2.5 Flash — Reasoning & Code Generation |
 | Execution Sandbox | [E2B Code Interpreter](https://e2b.dev/) — Secure Cloud Execution |
-| Repository Access | [PyGithub](https://github.com/PyGithub/PyGithub) — GitHub API Integration |
+| Repository Access | [PyGithub](https://github.com/PyGithub/PyGithub) — GitHub App API Integration |
 
 ---
 

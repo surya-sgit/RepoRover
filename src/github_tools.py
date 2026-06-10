@@ -1,26 +1,71 @@
 import os
-from github import Github, Auth
-from typing import Dict, Any, List
+from github import Github, GithubIntegration, Auth
+from typing import Dict, Any, List, Optional
 
 class GitHubConnector:
-    def __init__(self, repo_name: str = None):
+    def __init__(self, repo_name: str = None, *, github_client: "Github" = None):
         """
         Initializes the connection to GitHub.
+
         :param repo_name: "owner/repo" string (e.g., "octocat/Hello-World")
+        :param github_client: Pre-authenticated ``Github`` instance. When omitted,
+            falls back to a ``GITHUB_TOKEN`` personal access token (local smoke
+            testing only). Production callers should use
+            :meth:`from_installation` to obtain a short-lived installation token
+            (PRD §3.4, §6).
         """
-        token = os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise ValueError("GITHUB_TOKEN not found in environment variables.")
-        
-        auth = Auth.Token(token)
-        self.g = Github(auth=auth)
-        
+        if github_client is not None:
+            self.g = github_client
+        else:
+            token = os.environ.get("GITHUB_TOKEN")
+            if not token:
+                raise ValueError("GITHUB_TOKEN not found in environment variables.")
+            self.g = Github(auth=Auth.Token(token))
+
         if repo_name:
             try:
                 self.repo = self.g.get_repo(repo_name)
                 print(f"Connected to: {self.repo.full_name}")
             except Exception as e:
                 raise ValueError(f"Could not connect to repo {repo_name}: {e}")
+
+    @classmethod
+    def from_installation(
+        cls,
+        repo_name: str,
+        installation_id: int,
+        app_id: str,
+        private_key: str,
+    ) -> "GitHubConnector":
+        """
+        Build a connector authenticated as a GitHub App installation.
+
+        Mints a short-lived installation access token (PRD §3.4, §6) — the bot
+        never holds a long-lived personal token, and access is scoped strictly to
+        the repositories the user granted at install time.
+        """
+        if not app_id or not private_key:
+            raise ValueError("GitHub App credentials (app_id / private_key) are not configured.")
+        auth = Auth.AppAuth(app_id, private_key)
+        integration = GithubIntegration(auth=auth)
+        access_token = integration.get_access_token(int(installation_id)).token
+        client = Github(auth=Auth.Token(access_token))
+        return cls(repo_name, github_client=client)
+
+    def post_pr_comment(self, pr_number: int, body: str) -> int:
+        """
+        Post a comment on a pull request's conversation thread and return its id.
+
+        Used by the orchestration layer to deliver review results and the
+        Execution Paused notice straight into the PR (PRD §3.5, §5.2).
+        """
+        issue = self.repo.get_issue(pr_number)
+        comment = issue.create_comment(body)
+        return comment.id
+
+    def get_latest_commit_sha(self, pr_number: int) -> str:
+        """Return the head SHA of a PR, used to guard against stale executions (PRD §4.3)."""
+        return self.repo.get_pull(pr_number).head.sha
 
     def get_pr_details(self, pr_number: int) -> Dict[str, Any]:
         """

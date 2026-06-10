@@ -1,10 +1,16 @@
 import sys
-from src.graph import app 
+from src.graph import build_local_app
 from src.github_tools import GitHubConnector
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Local smoke-test entrypoint only. Production review runs are driven by the
+# Django webhook -> Celery -> LangGraph pipeline (see engine/tasks.py); this
+# module keeps the interactive terminal loop for developer validation against a
+# single PR using GITHUB_TOKEN / GOOGLE_API_KEY / E2B_API_KEY from .env.
+app = build_local_app()
 
 # --- CONFIGURATION ---
 REPO_NAME = "abhayk-gupta/test_multi_file" 

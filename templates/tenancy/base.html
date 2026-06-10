@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RepoRover Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; color: #1b1f24; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e1e4e8; padding-bottom: .75rem; }
+    a { color: #0969da; text-decoration: none; }
+    .card { border: 1px solid #e1e4e8; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    .msg { background: #ddf4ff; border: 1px solid #54aeff; border-radius: 6px; padding: .5rem .75rem; margin: .5rem 0; }
+    label { display: block; font-weight: 600; margin-top: .75rem; }
+    input[type=text], input[type=password], input[type=number], textarea { width: 100%; padding: .4rem; box-sizing: border-box; }
+    button { margin-top: 1rem; background: #1f883d; color: #fff; border: 0; border-radius: 6px; padding: .5rem 1rem; cursor: pointer; }
+    .pill { font-size: .8rem; background: #eaeef2; border-radius: 12px; padding: .1rem .6rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>🤖 RepoRover</strong>
+    <nav>
+      {% if login %}<span class="pill">{{ login }}</span> · <a href="{% url 'tenancy:dashboard' %}">Dashboard</a> · <a href="{% url 'tenancy:logout' %}">Log out</a>{% endif %}
+    </nav>
+  </header>
+  {% if messages %}
+    {% for m in messages %}<div class="msg">{{ m }}</div>{% endfor %}
+  {% endif %}
+  {% block content %}{% endblock %}
+</body>
+</html>

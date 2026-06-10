@@ -1,0 +1,26 @@
+{% extends "tenancy/base.html" %}
+{% block content %}
+<h1>Repository Settings — Installation #{{ org.github_installation_id }}</h1>
+
+{% if repos %}
+<div class="card">
+  <h3>Configured repositories</h3>
+  <ul>
+    {% for r in repos %}
+      <li><strong>{{ r.repository_name }}</strong> — max concurrency {{ r.max_concurrency }};
+        ignored: {{ r.ignored_directories|join:", "|default:"none" }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<div class="card">
+  <h3>Add / update a repository</h3>
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Save repository</button>
+  </form>
+</div>
+<p><a href="{% url 'tenancy:dashboard' %}">← Back</a></p>
+{% endblock %}

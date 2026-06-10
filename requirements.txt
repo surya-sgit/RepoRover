@@ -1,8 +1,6 @@
-langgraph 
-langchain-google-genai 
-e2b-code-interpreter==1.0.3
-pydantic
-python-dotenv
-IPython
-PyGithub
-chainlit
+# Dependencies are now managed via pyproject.toml + uv.
+# To install: uv sync
+# For dev deps: uv sync --extra dev
+#
+# This file is kept for compatibility with tools that expect requirements.txt.
+-e .

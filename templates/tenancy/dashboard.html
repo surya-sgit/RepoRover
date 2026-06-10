@@ -1,0 +1,15 @@
+{% extends "tenancy/base.html" %}
+{% block content %}
+<h1>Your installations</h1>
+{% if not orgs %}
+  <p>No RepoRover installations found for your account. Install the GitHub App, then return here.</p>
+{% endif %}
+{% for org in orgs %}
+  <div class="card">
+    <h3>Installation #{{ org.github_installation_id }}</h3>
+    <p>BYOK keys: {% if org.has_keys %}✅ configured{% else %}⚠️ not configured{% endif %}</p>
+    <a href="{% url 'tenancy:org_keys' org.id %}">Manage keys</a> ·
+    <a href="{% url 'tenancy:repo_settings' org.id %}">Repository settings</a>
+  </div>
+{% endfor %}
+{% endblock %}

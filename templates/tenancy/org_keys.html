@@ -1,0 +1,13 @@
+{% extends "tenancy/base.html" %}
+{% block content %}
+<h1>BYOK Keys — Installation #{{ org.github_installation_id }}</h1>
+<p>Keys are encrypted at rest (AES) and used only inside ephemeral workers. They are never displayed back.</p>
+<div class="card">
+  <form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Save keys</button>
+  </form>
+</div>
+<p><a href="{% url 'tenancy:dashboard' %}">← Back</a></p>
+{% endblock %}
