@@ -142,6 +142,10 @@ def call_agent_b(state: AgentState, config=None):
     # Runtime / human-rejection logs steer the revision (PRD §3.5, §3.6).
     execution_logs = state.get("execution_logs", "")
 
+    # Generate token-efficient context
+    context_skeleton = _build_context_skeleton(repo_files, state["file_path"])
+
+    # 1. FIX THE PROMPT: Demand full code, no diffs.
     prompt = f"""
     You are a Python Code Refactoring Agent.
 
@@ -153,30 +157,23 @@ def call_agent_b(state: AgentState, config=None):
     CONTEXT:
     1. Static Analysis Issues: {issues}
     2. RUNTIME ERRORS (CRITICAL): {execution_logs}
+    3. REPOSITORY CONTEXT (Available Imports & Signatures):
+        The following structural context shows available classes and functions in the repo. 
+        Use this to verify if the target code is calling imported functions correctly.
+        {context_skeleton}
 
     INSTRUCTIONS:
     - If there are Runtime Errors, you MUST fix the code to resolve them.
-    - Specifically check for missing imports (like 'math') or syntax errors.
+    - Return the FULL, completely refactored Python code. 
+    - DO NOT truncate, use placeholders, or omit any existing logic.
+    - DO NOT format the output as a git diff. Just the raw python code.
     - If the code is perfect and there are no errors, return the string "NO_CHANGES".
-    !IMPORTANT!
-    - Generate a unified code diff comparison.
-    - Use a standard git diff markdown block format starting with ```diff.
-    - Mark removed lines with a leading '-' and added lines with a leading '+'.
-
-    Example Output format:
-    ```diff
-    def compute_risk_factor(base_score, multiplier):
-    -     final_index = base_score / multiplier
-    +     if multiplier == 0:
-    +         return 0
-    +     final_index = base_score / multiplier
-    ```
     """
 
     response = llm.invoke([HumanMessage(content=prompt)])
     result_code = response.content.strip()
 
-    # Strip markdown fences if the model adds them.
+    # Strip markdown fences
     if result_code.startswith("```python"):
         result_code = result_code.split("```python")[1].split("```")[0].strip()
     elif result_code.startswith("```"):
@@ -184,12 +181,25 @@ def call_agent_b(state: AgentState, config=None):
 
     if result_code == "NO_CHANGES":
         print("Agent B: No changes needed.")
-        return {"refactored_code": code}
+        return {"refactored_code": code, "code_diff": None}
 
-    print("Agent B: Code refactored.")
+    # 2. GENERATE THE DIFF PROGRAMMATICALLY
+    original_lines = state["original_code"].splitlines(keepends=True)
+    new_lines = result_code.splitlines(keepends=True)
+    
+    diff_generator = difflib.unified_diff(
+        original_lines, 
+        new_lines, 
+        fromfile=state["file_path"], 
+        tofile=state["file_path"]
+    )
+    diff_string = "".join(diff_generator)
+
+    print("Agent B: Code refactored and diff generated.")
     return {
         "refactored_code": result_code,
-        "iteration_count": state.get("iteration_count", 0),  # Preserve count
+        "code_diff": diff_string, # <--- Pass diff to state
+        "iteration_count": state.get("iteration_count", 0),
     }
 
 

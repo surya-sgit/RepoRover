@@ -35,6 +35,7 @@ def render_review_comment(
     intent_summary: str,
     review_issues: List[dict],
     refactored_code: str,
+    code_diff: str = "",
     iteration: int = 0,
 ) -> str:
     """Intermediate comment: Agent A findings + Agent B proposed patch (PRD §3.5)."""
@@ -60,12 +61,21 @@ def render_review_comment(
     lines.append("")
 
     lines.append("### Proposed Refactor")
-    code = (refactored_code or "").replace("```", "ʼʼʼ")
-    if len(code) > 8000:
-        code = code[:8000] + "\n# …(truncated)"
-    lines.append("```python")
-    lines.append(code)
-    lines.append("```")
+    
+    # 1. Render the programmatic diff instead of the raw code
+    if code_diff:
+        diff_text = sanitize(code_diff, 8000)
+        lines.append("```diff")
+        lines.append(diff_text)
+        lines.append("```")
+    else:
+        # Fallback if diff generation failed but code changed
+        code = (refactored_code or "").replace("```", "ʼʼʼ")
+        if len(code) > 8000:
+            code = code[:8000] + "\n# …(truncated)"
+        lines.append("```python")
+        lines.append(code)
+        lines.append("```")
     lines.append("")
 
     lines.append("---")
