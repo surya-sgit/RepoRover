@@ -72,15 +72,31 @@ for i, target_file in enumerate(target_files):
         print("Skipping to next file...")
         continue
 
+    # --- NEW: Test Discovery ---
+    expected_test_name = f"test_{filename.split('/')[-1]}" # e.g., test_utils.py
+    alt_test_name = f"{filename.split('/')[-1].replace('.py', '')}_test.py" # e.g., utils_test.py
+    
+    existing_test_path = None
+    existing_test_code = None
+    
+    for filepath, content in repo_context_map.items():
+        if filepath.endswith(expected_test_name) or filepath.endswith(alt_test_name):
+            existing_test_path = filepath
+            existing_test_code = content
+            break
+
     # 2. Initialize State for THIS specific file
     initial_state = {
         "repo_path": REPO_NAME,
         "file_path": filename,
         "file_content": full_content,
         "original_code": full_content,
-        "repo_files": repo_context_map,  # <--- PASS THE FULL MAP HERE
+        "repo_files": repo_context_map,
         "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
-        "iteration_count": 0
+        "iteration_count": 0,
+        # --- NEW STATE VARIABLES ---
+        "existing_test_path": existing_test_path,
+        "existing_test_code": existing_test_code,
     }
 
     # 3. Unique Thread ID per file

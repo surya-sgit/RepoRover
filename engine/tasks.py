@@ -96,6 +96,19 @@ def _start_review(session: ReviewSession, org, repo):
         content = repo_map.get(filename) or gh.get_file_content(
             filename, branch=pr_data["head_branch"]
         )
+        
+        # --- NEW: Test Discovery ---
+        expected_test_name = f"test_{filename.split('/')[-1]}"
+        alt_test_name = f"{filename.split('/')[-1].replace('.py', '')}_test.py"
+        
+        existing_test_path = None
+        existing_test_code = None
+        for filepath, f_content in repo_map.items():
+            if filepath.endswith(expected_test_name) or filepath.endswith(alt_test_name):
+                existing_test_path = filepath
+                existing_test_code = f_content
+                break
+
         llm_instance = services.get_tenant_llm(org)
         thread_id = str(session.langgraph_thread_id)
         config = services.tenant_runtime_config(org, thread_id)
@@ -107,6 +120,9 @@ def _start_review(session: ReviewSession, org, repo):
             "repo_files": repo_map,
             "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
             "iteration_count": 0,
+            # --- NEW STATE VARIABLES ---
+            "existing_test_path": existing_test_path,
+            "existing_test_code": existing_test_code,
         }
         config["configurable"]["llm"] = llm_instance
         app = get_app()
@@ -268,6 +284,7 @@ def _report_pause(gh, session: ReviewSession, app, config, filename: str):
             intent_summary=values.get("intent_summary", ""),
             review_issues=values.get("review_issues", []),
             refactored_code=values.get("refactored_code", ""),
+            code_diff=values.get("code_diff", ""),
             iteration=values.get("iteration_count", 0),
         ),
     )

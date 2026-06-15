@@ -1,6 +1,9 @@
 import os
 import re
+import difflib
 from typing import List, Optional
+import ast
+from typing import Dict
 
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -107,6 +110,42 @@ def _build_llm(config):
 def _e2b_api_key(config) -> Optional[str]:
     return _configurable(config).get("e2b_api_key") or os.environ.get("E2B_API_KEY")
 
+def _build_context_skeleton(repo_files: Dict[str, str], current_file: str) -> str:
+    """
+    Parses full file contents into lightweight structural signatures 
+    (Classes, Functions, and Docstrings) to save LLM context tokens.
+    """
+    skeleton_lines = []
+    
+    for filepath, content in repo_files.items():
+        if filepath == current_file or not filepath.endswith(".py"):
+            continue
+            
+        skeleton_lines.append(f"\n### File: {filepath} ###")
+        try:
+            tree = ast.parse(content)
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+                    # Extract function signature
+                    args = [a.arg for a in node.args.args]
+                    skeleton_lines.append(f"def {node.name}({', '.join(args)}):")
+                    if ast.get_docstring(node):
+                        skeleton_lines.append(f"    \"\"\"{ast.get_docstring(node)}\"\"\"")
+                        
+                elif isinstance(node, ast.ClassDef):
+                    # Extract class and its methods
+                    skeleton_lines.append(f"class {node.name}:")
+                    if ast.get_docstring(node):
+                        skeleton_lines.append(f"    \"\"\"{ast.get_docstring(node)}\"\"\"")
+                    for class_node in node.body:
+                        if isinstance(class_node, ast.FunctionDef):
+                            args = [a.arg for class_node in class_node.args.args]
+                            skeleton_lines.append(f"    def {class_node.name}({', '.join(args)}): pass")
+        except SyntaxError:
+            skeleton_lines.append("# (Syntax error parsing this file)")
+            
+    return "\n".join(skeleton_lines)
+
 
 # --- 3. Agent A: Reviewer ---
 def call_agent_a(state: AgentState, config=None):
@@ -114,13 +153,23 @@ def call_agent_a(state: AgentState, config=None):
     print(f"--- Agent A: Reviewing Code ({llm.__class__.__name__}) ---")
 
     code = state["original_code"]
+    repo_files = state.get("repo_files", {})
+
+    # Generate token-efficient context
+    context_skeleton = _build_context_skeleton(repo_files, state["file_path"])
 
     # Native schema mapping enforced through the unified interface wrapper
     structured_llm = llm.with_structured_output(ReviewOutput)
 
-    system_prompt = """You are a Principal Software Architect.
+    system_prompt = f"""You are a Principal Software Architect.
     Analyze the provided code for logic errors, security vulnerabilities, and code style issues.
     Do NOT focus on simple formatting. Focus on bugs and safety.
+
+    --- REPOSITORY CONTEXT (Available Imports & Signatures) ---
+    The following structural context shows available classes and functions in the repo. 
+    Use this to verify if the target code is calling imported functions correctly.
+    {context_skeleton}
+    -----------------------------------------------------------
     """
 
     response = structured_llm.invoke(f"{system_prompt}\n\nCode to Review:\n{code}")
@@ -138,6 +187,7 @@ def call_agent_b(state: AgentState, config=None):
 
     code = state.get("refactored_code") or state.get("original_code")
     issues = state.get("review_issues", [])
+    repo_files = state.get("repo_files", {})
 
     # Runtime / human-rejection logs steer the revision (PRD §3.5, §3.6).
     execution_logs = state.get("execution_logs", "")
@@ -202,23 +252,24 @@ def call_agent_b(state: AgentState, config=None):
         "iteration_count": state.get("iteration_count", 0),
     }
 
-
 # --- 5. Executor: E2B Sandbox with self-healing loop (PRD §3.5, §6.1) ---
 def call_executor(state: AgentState, config=None):
-    print("EXECUTOR: Running code in E2B Sandbox...")
+    print("EXECUTOR: Running pytest with Coverage in E2B Sandbox...")
 
     target_file = state["file_path"]
-    code_to_run = state.get("refactored_code") or state.get("original_code")
-
-    repo_files = dict(state.get("repo_files", {}))  # copy; don't mutate checkpointed state
-    # Mount the latest refactored code so imports resolve to the fix.
+    code_to_run = state.get("refactored_code")
+    test_code = state.get("final_test_code")
+    test_path = state.get("existing_test_path") or f"test_{target_file.split('/')[-1]}"
+    
+    repo_files = dict(state.get("repo_files", {}))
     repo_files[target_file] = code_to_run
+    repo_files[test_path] = test_code
 
     current_count = state.get("iteration_count", 0)
     api_key = _e2b_api_key(config)
 
-    def run_in_sandbox(sbx, code, files):
-        # Hydrate the sandbox filesystem with the dependency map (PRD §3.4).
+    def run_tests_in_sandbox(sbx, files):
+        # 1. Hydrate sandbox
         print(f"   Hydrating sandbox with {len(files)} files...")
         for path, content in files.items():
             directory = os.path.dirname(path)
@@ -226,54 +277,51 @@ def call_executor(state: AgentState, config=None):
                 sbx.commands.run(f"mkdir -p {directory}")
             sbx.files.write(path, content)
 
-        execution = sbx.run_code(code)
-        if execution.error:
-            return False, execution.error
-        return True, execution.logs.stdout
+        # 2. Install testing requirements
+        sbx.commands.run("pip install pytest pytest-cov")
+
+        # 3. Execute tests with Coverage thresholds
+        # Extract module name for coverage tracking (e.g. 'src/utils.py' -> 'src.utils')
+        cov_module = target_file.replace("/", ".").replace(".py", "")
+        cmd = f"python -m pytest {test_path} --cov={cov_module} --cov-report=term-missing --cov-fail-under=80"
+        
+        print(f"   Executing: {cmd}")
+        execution = sbx.commands.run(cmd)
+        
+        return execution
 
     try:
-        # Sandbox hardening: only run_code + ModuleNotFoundError-driven pip
-        # installs are permitted; no arbitrary shell from the model (PRD §6.1).
         with Sandbox(api_key=api_key) as sbx:
-            success, result = run_in_sandbox(sbx, code_to_run, repo_files)
+            execution = run_tests_in_sandbox(sbx, repo_files)
+            logs = execution.stdout + "\n" + execution.stderr
 
-            # --- Auto-fix a single missing dependency, then retry ---
-            if not success and "ModuleNotFoundError" in getattr(result, "name", ""):
-                match = re.search(r"No module named '(\w+)'", result.value)
-                if match:
-                    package_name = match.group(1)
-                    print(f"   Found missing dependency: {package_name}")
-                    print(f"   Installing {package_name}...")
-                    sbx.commands.run(f"pip install {package_name}")
-
-                    print("   Retrying execution...")
-                    success, result = run_in_sandbox(sbx, code_to_run, repo_files)
-
-            if not success:
-                print(f"   -> Execution Failed: {result.name}")
-                error_details = f"Error: {result.name}: {result.value}\n{result.traceback}"
-                print(error_details)
+            # Exit Code 0: Tests pass AND coverage > 80%
+            if execution.exit_code == 0:
+                print("   -> Execution Successful (Tests Passed & Coverage Met)")
                 return {
-                    "execution_status": "FAILURE",
-                    "execution_logs": error_details,
-                    "iteration_count": current_count + 1,
+                    "execution_status": "SUCCESS", 
+                    "execution_logs": logs,
+                    "next_node": "agent_c" 
                 }
 
-            print("   -> Execution Successful")
-            output_logs = "\n".join(result) if result else "Code ran successfully."
+            # If it fails, determine WHY and set the next_node
+            failure_reason = ""
+            if "Coverage failure" in logs or "Required test coverage of" in logs:
+                failure_reason = "COVERAGE_TOO_LOW: You did not test enough of the code."
+                next_agent = "test_engineer_node" # Send back to Test Engineer
+            else:
+                failure_reason = "TESTS_FAILED: The refactored code broke the tests."
+                next_agent = "refactorer_node" # Send back to Refactorer
+
             return {
-                "execution_status": "SUCCESS",
-                "execution_logs": output_logs,
+                "execution_status": "FAILURE",
+                "execution_logs": f"{failure_reason}\n\n{logs}",
+                "iteration_count": current_count + 1,
+                "next_node": next_agent  # <--- Explicitly say where to go
             }
 
     except Exception as e:
-        print(f"   -> Sandbox Infrastructure Error: {e}")
-        return {
-            "execution_status": "FAILURE",
-            "execution_logs": str(e),
-            "iteration_count": current_count + 1,
-        }
-
+        return {"execution_status": "FAILURE", "execution_logs": str(e)}
 
 # --- 6. Agent C: Documenter ---
 def call_agent_c(state: AgentState, config=None):
@@ -303,4 +351,48 @@ def call_agent_c(state: AgentState, config=None):
     return {
         "updated_readme": doc_update,
         "documentation_diff": doc_update,
+    }
+
+def call_agent_t(state: AgentState, config=None):
+    llm = _build_llm(config)
+    print(f"--- Agent T: Writing/Modifying Tests ({llm.__class__.__name__}) ---")
+
+    refactored_code = state.get("refactored_code")
+    existing_test = state.get("existing_test_code")
+    
+    prompt = f"""
+    You are a Senior SDET (Software Development Engineer in Test).
+    Agent B has just refactored the following file ({state['file_path']}):
+    
+    ```python
+    {refactored_code}
+    ```
+    """
+
+    if existing_test:
+        prompt += f"""
+        EXISTING TEST SUITE FOUND ({state['existing_test_path']}):
+        ```python
+        {existing_test}
+        ```
+        INSTRUCTIONS:
+        1. MODIFY this existing test suite to handle the new implementation.
+        2. Ensure you do not break the tests for unrelated functions in this file.
+        3. Add new `pytest` functions for the specific logic that was changed.
+        4. Return the FULL, modified test suite.
+        """
+    else:
+        prompt += """
+        No existing tests were found.
+        INSTRUCTIONS:
+        1. Create a brand new `pytest` suite for this file.
+        2. Use `unittest.mock` to mock all external network/DB calls.
+        3. Return the FULL test script.
+        """
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    test_code = response.content.strip().replace("```python", "").replace("```", "")
+
+    return {
+        "final_test_code": test_code
     }

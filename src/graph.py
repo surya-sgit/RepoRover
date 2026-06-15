@@ -15,11 +15,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from src.state import AgentState
-from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c
+from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c, call_agent_t
 
 
 # --- Conditional routing after the executor (self-healing loop) ---
-def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer_node", "__end__"]:
+def route_after_executor(state: AgentState) -> Literal["documenter_node", "refactorer_node","test_engineer_node", "__end__"]:
     status = state.get("execution_status")
     count = state.get("iteration_count", 0)
 
@@ -33,9 +33,16 @@ def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer
         return "documenter_node"
 
     # 3. FAILURE -> Retry loop, strict ceiling of 3 iterations (PRD §3.5)
-    if status == "FAILURE" and count < 3:
-        print(f"--- FAILED (Attempt {count}). Looping back... ---")
-        return "refactorer_node"
+    if status == "FAILURE":
+        if count >= 3:
+            print(f"--- MAX RETRIES REACHED ({count}). Terminating. ---")
+            return END
+        
+        # Pull the intelligent routing decision made by the E2B Sandbox
+        # (Defaults to refactorer_node if the state variable is missing)
+        next_node = state.get("next_node", "refactorer_node")
+        print(f"--- FAILED (Attempt {count}). Routing back to {next_node}... ---")
+        return next_node
 
     # 4. MAX RETRIES or terminal end
     print("Process Ended.")
@@ -46,15 +53,31 @@ def should_continue(state: AgentState) -> Literal["documenter_node", "refactorer
 def build_workflow() -> StateGraph:
     workflow = StateGraph(AgentState)
 
+    # 1. Add all nodes
     workflow.add_node("reviewer_node", call_agent_a)
     workflow.add_node("refactorer_node", call_agent_b)
+    workflow.add_node("test_engineer_node", call_agent_t)  # <--- NEW: Add Agent T
     workflow.add_node("executor_tool_node", call_executor)
     workflow.add_node("documenter_node", call_agent_c)
 
+    # 2. Define the Standard Linear Flow
     workflow.add_edge(START, "reviewer_node")
     workflow.add_edge("reviewer_node", "refactorer_node")
-    workflow.add_edge("refactorer_node", "executor_tool_node")
-    workflow.add_conditional_edges("executor_tool_node", should_continue)
+    workflow.add_edge("refactorer_node", "test_engineer_node")  # <--- NEW: Code is written -> Write tests
+    workflow.add_edge("test_engineer_node", "executor_tool_node")  # <--- NEW: Tests written -> Send to E2B Sandbox
+
+    # 3. Define the Self-Healing Routing (After the Sandbox)
+    workflow.add_conditional_edges(
+        "executor_tool_node", 
+        route_after_executor,
+        {
+            "refactorer_node": "refactorer_node",        # Tests failed because code is broken
+            "test_engineer_node": "test_engineer_node",  # Tests failed because coverage is too low
+            "documenter_node": "documenter_node",        # Execution Success or User Skip
+            END: END                                     # Max retries hit
+        }
+    )
+    
     workflow.add_edge("documenter_node", END)
 
     return workflow

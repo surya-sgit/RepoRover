@@ -10,6 +10,7 @@ class AgentState(TypedDict):
     
     # NEW: Holds the entire relevant file system {"utils.py": "def foo()..."}
     repo_files: Dict[str, str] 
+    next_node: str
 
     # --- Agent A Artifacts ---
     intent_summary: str
@@ -18,6 +19,7 @@ class AgentState(TypedDict):
 
     # --- Agent B Artifacts ---
     refactored_code: Optional[str]
+    code_diff: Optional[str]
     execution_status: str
     execution_logs: Optional[str]
     iteration_count: int
@@ -26,6 +28,12 @@ class AgentState(TypedDict):
     # --- Agent C Artifacts ---
     documentation_diff: Optional[str]
     updated_readme: Optional[str]
+
+    # --- Agent T (Test Engineer) Artifacts ---
+    existing_test_path: Optional[str]
+    existing_test_code: Optional[str]
+    final_test_code: Optional[str]   # The new or modified test suite
+    coverage_score: Optional[float]
 
     # --- Human-in-the-Loop ---
     human_approval: bool
