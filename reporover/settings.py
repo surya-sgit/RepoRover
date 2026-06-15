@@ -75,57 +75,29 @@ WSGI_APPLICATION = "reporover.wsgi.application"
 ASGI_APPLICATION = "reporover.asgi.application"
 
 # --- Database (PostgreSQL per PRD §4) ---
-from urllib.parse import urlparse, unquote, quote
+import dj_database_url
 
 postgres_dsn_env = env("POSTGRES_DSN")
 
 if postgres_dsn_env:
-    dsn_clean = postgres_dsn_env
-    if dsn_clean.startswith("postgresql://"):
-        body = dsn_clean[len("postgresql://"):]
-        scheme = "postgresql"
-    elif dsn_clean.startswith("postgres://"):
-        body = dsn_clean[len("postgres://"):]
-        scheme = "postgres"
-    else:
-        body = dsn_clean
-        scheme = "postgresql"
-
-    # Always split on the rightmost '@' to safely isolate host info first
-    credentials, separator, host_info = body.rpartition("@")
+    # 1. Let dj-database-url handle all the complex parsing (ports, passwords, query params)
+    DATABASES = {
+        "default": dj_database_url.parse(
+            postgres_dsn_env,
+            conn_max_age=600,         # Enterprise standard connection pooling
+            conn_health_checks=True,
+        )
+    }
     
-    if separator:
-        user, _, password = credentials.partition(":")
-        host_port, _, db_name = host_info.partition("/")
-        host, _, port = host_port.partition(":")
-        
-        # Normalize: Convert any potential %40 back to literal '@' for Django
-        literal_user = unquote(user)
-        literal_password = unquote(password)
-        
-        # 1. Populate Django with the literal, unquoted values it expects
-        DATABASES = {
-            "default": {
-                "ENGINE": "django.db.backends.postgresql",
-                "NAME": db_name,
-                "USER": literal_user,
-                "PASSWORD": literal_password,
-                "HOST": host,
-                "PORT": port if port else "5432",
-                "OPTIONS": {
-                    "sslmode": "prefer",  # Secure handshake alignment for managed cloud DBs
-                },
-            }
-        }
-        
-        # 2. Re-encode the password strictly to ensure Celery/LangGraph/psycopg 
-        # never see a raw '@' character that triggers host resolution crashes.
-        encoded_password = quote(literal_password)
-        POSTGRES_DSN = f"{scheme}://{literal_user}:{encoded_password}@{host_info}"
-        os.environ["POSTGRES_DSN"] = POSTGRES_DSN
-        
-    else:
-        raise RuntimeError("Invalid or malformed POSTGRES_DSN string found in environment parameters.")
+    # Ensure sslmode prefer is set for managed cloud DBs if not explicitly in the DSN
+    if "OPTIONS" not in DATABASES["default"]:
+        DATABASES["default"]["OPTIONS"] = {}
+    if "sslmode" not in DATABASES["default"]["OPTIONS"]:
+        DATABASES["default"]["OPTIONS"]["sslmode"] = "prefer"
+    
+    # 2. Keep the DSN in the environment for LangGraph's psycopg_pool checkpointer
+    os.environ["POSTGRES_DSN"] = postgres_dsn_env
+
 else:
     # Fallback to individual local environment variables if DSN is missing
     DATABASES = {
@@ -141,6 +113,8 @@ else:
             },
         }
     }
+    
+    # Reconstruct the DSN strictly for LangGraph's checkpointer fallback
     POSTGRES_DSN = "postgresql://{user}:{password}@{host}:{port}/{name}".format(
         user=DATABASES["default"]["USER"],
         password=DATABASES["default"]["PASSWORD"],
@@ -148,6 +122,7 @@ else:
         port=DATABASES["default"]["PORT"],
         name=DATABASES["default"]["NAME"],
     )
+    os.environ["POSTGRES_DSN"] = POSTGRES_DSN
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
