@@ -426,3 +426,42 @@ def call_agent_t(state: AgentState, config=None):
         "pypi_dependencies": response.pypi_dependencies
     }
 
+# --- 8 Agent D: The Diplomat (Conflict Resolver) ---
+def call_agent_d_diplomat(state: AgentState, config=None):
+    llm = _build_llm(config)
+    print(f"--- Agent D: Resolving Merge Conflicts ({llm.__class__.__name__}) ---")
+
+    conflict_content = state.get("conflict_file_content")
+    execution_logs = state.get("execution_logs", "")
+
+    prompt = f"""
+    You are an Expert Git Conflict Resolver. 
+    The following file contains standard git merge conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`).
+
+    FILE:
+    ```python
+    {conflict_content}
+    ```
+
+    PREVIOUS ERRORS (If this is a retry):
+    {execution_logs}
+
+    INSTRUCTIONS:
+    1. Semantically merge the two conflicting blocks. 
+    2. Understand the intent of both the HEAD (new feature) and the base branch changes. Do not simply delete one side if both logics are necessary.
+    3. Remove ALL git conflict markers from your output.
+    4. Return the FULL, executable, and resolved Python file. Do not use formatting diffs.
+    """
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    result_code = response.content.strip()
+
+    if result_code.startswith("```python"):
+        result_code = result_code.split("```python")[1].split("```")[0].strip()
+    elif result_code.startswith("```"):
+        result_code = result_code.split("```")[1].split("```")[0].strip()
+
+    return {
+        "refactored_code": result_code,
+        "iteration_count": state.get("iteration_count", 0),
+    }

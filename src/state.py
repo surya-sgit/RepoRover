@@ -20,6 +20,11 @@ class AgentState(TypedDict):
     # --- Agent B Artifacts ---
     refactored_code: Optional[str]
     code_diff: Optional[str]
+
+    # --- Agent D Artifacts (Conflict Resolution) ---
+    conflict_file_content: Optional[str] # The file with <<<<<<< HEAD markers
+
+    # --- Executor Artifacts ---
     execution_status: str
     execution_logs: Optional[str]
     iteration_count: int

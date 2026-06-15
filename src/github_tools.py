@@ -1,4 +1,7 @@
 import os
+import subprocess
+import tempfile
+import shutil
 from github import Github, GithubIntegration, Auth
 from typing import Dict, Any, List, Optional
 
@@ -225,3 +228,67 @@ class GitHubConnector:
                     pass
         
         return repo_map
+    
+    def generate_conflict_markers(self, base_branch: str, head_branch: str, file_path: str) -> Optional[str]:
+        """
+        Option B: Uses a local shallow clone to force Git to generate exact conflict markers.
+        Extremely fast and uses zero E2B credits.
+        """
+        # Extract the raw token to authenticate the subprocess clone
+        token = self.g.get_user()._requester.auth.token
+        clone_url = f"https://x-access-token:{token}@github.com/{self.repo.full_name}.git"
+        
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # 1. Shallow clone the base branch
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", base_branch, clone_url, temp_dir],
+                check=True, capture_output=True
+            )
+            
+            # 2. Fetch the head branch
+            subprocess.run(
+                ["git", "fetch", "origin", head_branch, "--depth", "1"],
+                cwd=temp_dir, check=True, capture_output=True
+            )
+            
+            # 3. Configure dummy git user for the merge action
+            subprocess.run(["git", "config", "user.email", "bot@reporover.com"], cwd=temp_dir)
+            subprocess.run(["git", "config", "user.name", "RepoRover"], cwd=temp_dir)
+            
+            # 4. Attempt the merge (This will fail and generate markers if there is a conflict)
+            subprocess.run(
+                ["git", "merge", "FETCH_HEAD", "--no-commit", "--no-ff"],
+                cwd=temp_dir, capture_output=True
+            )
+            
+            # 5. Read the generated file with the markers
+            full_path = os.path.join(temp_dir, file_path)
+            if not os.path.exists(full_path):
+                return None
+                
+            with open(full_path, "r", encoding="utf-8") as f:
+                return f.read()
+                
+        except Exception as e:
+            print(f"Error generating conflict markers: {e}")
+            return None
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def push_commit(self, branch: str, file_path: str, content: str, commit_message: str) -> bool:
+        """Pushes a direct commit to the branch to resolve the conflict."""
+        try:
+            # We need the SHA of the file we are replacing
+            file_data = self.repo.get_contents(file_path, ref=branch)
+            self.repo.update_file(
+                path=file_path,
+                message=commit_message,
+                content=content,
+                sha=file_data.sha,
+                branch=branch
+            )
+            return True
+        except Exception as e:
+            print(f"Failed to push commit: {e}")
+            return False

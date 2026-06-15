@@ -16,7 +16,7 @@ import logging
 
 from celery import shared_task
 
-from src.graph import get_app
+from src.graph import get_app, get_conflict_app
 from engine import services
 from engine.errors import (
     ProviderError,
@@ -35,7 +35,7 @@ CONCURRENCY_RETRY_DELAY = 30
 
 
 # --------------------------------------------------------------------------- #
-# Pull request -> start a review job
+# Core Orchestration Helpers
 # --------------------------------------------------------------------------- #
 
 def _trigger_pr_fanout(gh, org, repo, pr_number: int, head_sha: str):
@@ -68,6 +68,76 @@ def _trigger_pr_fanout(gh, org, repo, pr_number: int, head_sha: str):
         process_file_review.delay(session.id, org.id, repo.id)
 
 
+def _trigger_conflict_resolution(gh, org, repo, pr_number: int, target_file: str):
+    """Helper: Initiates the dedicated Agent D Conflict Resolution flow."""
+    pr_data = gh.get_pr_details(pr_number)
+    
+    conflict_content = gh.generate_conflict_markers(pr_data["base_branch"], pr_data["head_branch"], target_file)
+    if not conflict_content:
+        gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nCould not generate conflict markers for `{target_file}`. Are you sure this file currently has a merge conflict?")
+        return
+        
+    latest_sha = gh.get_latest_commit_sha(pr_number)
+    session = ReviewSession.objects.create(
+        repo_settings=repo,
+        pr_number=pr_number,
+        file_path=target_file,
+        commit_sha=latest_sha,
+        current_status=ReviewSession.Status.ANALYZING,
+        active_jobs=1,
+    )
+
+    repo_map = gh.get_repo_map(pr_data["files"], pr_data["head_branch"])
+    expected_test_name = f"test_{target_file.split('/')[-1]}"
+    alt_test_name = f"{target_file.split('/')[-1].replace('.py', '')}_test.py"
+    
+    existing_test_path = None
+    existing_test_code = None
+    for filepath, f_content in repo_map.items():
+        if filepath.endswith(expected_test_name) or filepath.endswith(alt_test_name):
+            existing_test_path = filepath
+            existing_test_code = f_content
+            break
+    
+    thread_id = str(session.langgraph_thread_id)
+    config = services.tenant_runtime_config(org, thread_id)
+    config["configurable"]["llm"] = services.get_tenant_llm(org)
+
+    initial_state = {
+        "repo_path": repo.repository_name,
+        "file_path": target_file,
+        "file_content": conflict_content,
+        "original_code": conflict_content,
+        "conflict_file_content": conflict_content,
+        "repo_files": repo_map,
+        "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
+        "existing_test_path": existing_test_path,
+        "existing_test_code": existing_test_code,
+        "iteration_count": 0,
+    }
+    
+    app = get_conflict_app()
+    
+    # Run Agent D -> Agent T -> pause before Executor
+    for _ in app.stream(initial_state, config=config):
+        pass
+        
+    snapshot = app.get_state(config)
+    proposed_code = snapshot.values.get("refactored_code", "")
+    
+    gh.post_inline_pr_comment(
+        pr_number, latest_sha, target_file,
+        f"{BOT_MARKER}\n### Proposed Merge Resolution\n```python\n{proposed_code}\n```\n\nReply with `/commit_merge` to push this directly to the branch."
+    )
+    
+    session.current_status = ReviewSession.Status.AWAITING_HUMAN
+    session.save(update_fields=["current_status", "updated_at"])
+
+
+# --------------------------------------------------------------------------- #
+# Webhook Entry Points
+# --------------------------------------------------------------------------- #
+
 @shared_task(bind=True, max_retries=None)
 def handle_pull_request(self, payload: dict):
     """Triggered on PR opened or synchronize."""
@@ -91,12 +161,21 @@ def handle_pull_request(self, payload: dict):
         raise self.retry(countdown=CONCURRENCY_RETRY_DELAY)
 
     gh = services.build_connector(org, repo)
+    
+    # --- The Conflict Abort Switch ---
+    if pr.get("mergeable") is False:
+        gh.post_pr_comment(
+            pr_number,
+            f"{BOT_MARKER}\n🚨 **Merge Conflicts Detected.**\nI cannot perform a standard review. Reply with `/resolve` and I will attempt to autonomously merge the files and write tests to verify the resolution."
+        )
+        return
+        
     _trigger_pr_fanout(gh, org, repo, pr_number, head_sha)
 
 
 @shared_task
 def process_file_review(session_id: int, org_id: int, repo_id: int):
-    """Executes the Agents A -> B loop for a single file concurrently."""
+    """Executes the Agents A -> B -> T loop for a single file concurrently."""
     session = ReviewSession.objects.get(id=session_id)
     org = OrganizationConfig.objects.get(id=org_id)
     repo = RepoSettings.objects.get(id=repo_id)
@@ -113,7 +192,7 @@ def process_file_review(session_id: int, org_id: int, repo_id: int):
             filename, branch=pr_data["head_branch"]
         )
         
-        # --- NEW: Test Discovery ---
+        # Test Discovery
         expected_test_name = f"test_{filename.split('/')[-1]}"
         alt_test_name = f"{filename.split('/')[-1].replace('.py', '')}_test.py"
         
@@ -137,13 +216,13 @@ def process_file_review(session_id: int, org_id: int, repo_id: int):
             "repo_files": repo_map,
             "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
             "iteration_count": 0,
-            # --- NEW STATE VARIABLES ---
             "existing_test_path": existing_test_path,
             "existing_test_code": existing_test_code,
         }
         config["configurable"]["llm"] = llm_instance
         app = get_app()
-        # Runs reviewer -> refactorer, then pauses before executor_tool_node.
+        
+        # Runs reviewer -> refactorer -> test engineer, then pauses before executor_tool_node.
         for _ in app.stream(initial_state, config=config):
             pass
 
@@ -158,7 +237,7 @@ def process_file_review(session_id: int, org_id: int, repo_id: int):
 # --------------------------------------------------------------------------- #
 @shared_task(bind=True)
 def handle_review_comment(self, payload: dict):
-    """Handles commands sent to INLINE review threads (e.g. /approve specific file)."""
+    """Handles commands sent to INLINE review threads (e.g. /approve specific file or /resolve)."""
     if payload.get("action") != "created":
         return
 
@@ -172,14 +251,25 @@ def handle_review_comment(self, payload: dict):
 
     installation_id = payload["installation"]["id"]
     repo_full_name = payload["repository"]["full_name"]
-    pr_number = payload["pull_request"]["number"] # <--- Inline events use pull_request directly
-    target_file = payload["comment"]["path"]      # GitHub explicitly gives us the path
+    pr_number = payload["pull_request"]["number"] 
+    target_file = payload["comment"]["path"]      
 
     org, repo = services.resolve_tenant(installation_id, repo_full_name)
     if not org or not repo:
         return
 
-    # Find the specific paused thread for THIS file
+    gh = services.build_connector(org, repo)
+
+    # ----------------------------------------------------------------------- #
+    # FRESH WORKFLOW: Resolve Merge Conflict
+    # ----------------------------------------------------------------------- #
+    if cmd.command == "resolve":
+        _trigger_conflict_resolution(gh, org, repo, pr_number, target_file)
+        return
+
+    # ----------------------------------------------------------------------- #
+    # RESUME WORKFLOW: Find the paused session for this specific file
+    # ----------------------------------------------------------------------- #
     session = (
         ReviewSession.objects.filter(
             repo_settings=repo,
@@ -194,10 +284,6 @@ def handle_review_comment(self, payload: dict):
     if not session:
         return  
 
-    gh = services.build_connector(org, repo)
-
-    # Guard against acting on stale code (PRD §4.3): a newer push supersedes
-    # this paused session.
     try:
         latest_sha = gh.get_latest_commit_sha(pr_number)
     except Exception:  
@@ -214,6 +300,38 @@ def handle_review_comment(self, payload: dict):
 
     thread_id = str(session.langgraph_thread_id)
     config = services.tenant_runtime_config(org, thread_id)
+    config["configurable"]["llm"] = services.get_tenant_llm(org)
+
+    # Hybrid Approval Path (Agent D / Conflict Graph)
+    if cmd.command == "commit_merge":
+        app = get_conflict_app()
+        snapshot = app.get_state(config)
+        vals = snapshot.values
+        pr_data = gh.get_pr_details(pr_number)
+        
+        # 1. Push the fixed code file
+        gh.push_commit(
+            pr_data["head_branch"], 
+            vals["file_path"], 
+            vals.get("refactored_code", ""), 
+            f"RepoRover: Resolved merge conflict in {vals['file_path']}"
+        )
+        
+        # 2. Strict Append Test Rule
+        existing_test_path = vals.get("existing_test_path")
+        if existing_test_path and vals.get("final_test_code"):
+            gh.push_commit(
+                pr_data["head_branch"], 
+                existing_test_path, 
+                vals["final_test_code"], 
+                f"RepoRover: Updated tests for {vals['file_path']} conflict resolution"
+            )
+            
+        gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nConflict resolved and successfully committed to the branch.")
+        _complete(session)
+        return
+
+    # Standard Execution Path (Agent A->B->T Graph)
     app = get_app()
     snapshot = app.get_state(config)
 
@@ -252,12 +370,12 @@ def handle_review_comment(self, payload: dict):
 
 @shared_task(bind=True)
 def handle_issue_comment(self, payload: dict):
-    """Handles global PR comments, specifically restoring the /review command."""
+    """Handles commands sent to the global PR conversation thread."""
     if payload.get("action") != "created":
         return
         
     if "pull_request" not in payload.get("issue", {}):
-        return  # This was a comment on a standard issue, not a PR
+        return  
         
     body = payload["comment"].get("body", "")
     if BOT_MARKER in body:
@@ -269,7 +387,7 @@ def handle_issue_comment(self, payload: dict):
 
     installation_id = payload["installation"]["id"]
     repo_full_name = payload["repository"]["full_name"]
-    pr_number = payload["issue"]["number"] # <--- Global comments use the issue envelope
+    pr_number = payload["issue"]["number"]
 
     org, repo = services.resolve_tenant(installation_id, repo_full_name)
     if not org or not repo:
@@ -286,13 +404,23 @@ def handle_issue_comment(self, payload: dict):
             return
 
         latest_sha = gh.get_latest_commit_sha(pr_number)
-        
-        # Trigger the multi-file fan-out using the new helper
         _trigger_pr_fanout(gh, org, repo, pr_number, latest_sha)
         return
+
+    if cmd.command == "resolve":
+        target_file = cmd.feedback.strip() if cmd.feedback else None
+        if not target_file:
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nPlease provide the filename you wish to resolve, e.g., `/resolve src/utils.py`")
+            return
+            
+        _trigger_conflict_resolution(gh, org, repo, pr_number, target_file)
+        return
+
+
 # --------------------------------------------------------------------------- #
 # Shared reporting helpers
 # --------------------------------------------------------------------------- #
+
 def _report_pause(gh, session: ReviewSession, app, config, filename: str):
     """Inspect the graph: if finished, post final; if paused, post a new proposal inline."""
     snapshot = app.get_state(config)

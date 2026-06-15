@@ -15,11 +15,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from src.state import AgentState
-from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c, call_agent_t
+from src.agents import call_agent_a, call_agent_b, call_executor, call_agent_c, call_agent_t, call_agent_d_diplomat
 
 
 # --- Conditional routing after the executor (self-healing loop) ---
-def route_after_executor(state: AgentState) -> Literal["documenter_node", "refactorer_node","test_engineer_node", "__end__"]:
+def route_after_executor(state: AgentState) -> Literal["documenter_node", "refactorer_node", "test_engineer_node", "__end__"]:
     status = state.get("execution_status")
     count = state.get("iteration_count", 0)
 
@@ -49,22 +49,22 @@ def route_after_executor(state: AgentState) -> Literal["documenter_node", "refac
     return END
 
 
-# --- Graph construction (uncompiled; reused by every compile target) ---
+# --- Standard Graph Construction (Uncompiled) ---
 def build_workflow() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     # 1. Add all nodes
     workflow.add_node("reviewer_node", call_agent_a)
     workflow.add_node("refactorer_node", call_agent_b)
-    workflow.add_node("test_engineer_node", call_agent_t)  # <--- NEW: Add Agent T
+    workflow.add_node("test_engineer_node", call_agent_t)
     workflow.add_node("executor_tool_node", call_executor)
     workflow.add_node("documenter_node", call_agent_c)
 
     # 2. Define the Standard Linear Flow
     workflow.add_edge(START, "reviewer_node")
     workflow.add_edge("reviewer_node", "refactorer_node")
-    workflow.add_edge("refactorer_node", "test_engineer_node")  # <--- NEW: Code is written -> Write tests
-    workflow.add_edge("test_engineer_node", "executor_tool_node")  # <--- NEW: Tests written -> Send to E2B Sandbox
+    workflow.add_edge("refactorer_node", "test_engineer_node")
+    workflow.add_edge("test_engineer_node", "executor_tool_node")
 
     # 3. Define the Self-Healing Routing (After the Sandbox)
     workflow.add_conditional_edges(
@@ -83,13 +83,40 @@ def build_workflow() -> StateGraph:
     return workflow
 
 
-def compile_app(checkpointer):
-    """Compile the graph with the given checkpointer.
+# --- Conflict Graph Construction (Uncompiled) ---
+def build_conflict_workflow() -> StateGraph:
+    """A dedicated graph exclusively for resolving merge conflicts."""
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("diplomat_node", call_agent_d_diplomat)
+    workflow.add_node("test_engineer_node", call_agent_t)
+    workflow.add_node("executor_tool_node", call_executor)
+
+    workflow.add_edge(START, "diplomat_node")
+    workflow.add_edge("diplomat_node", "test_engineer_node")
+    workflow.add_edge("test_engineer_node", "executor_tool_node")
+
+    workflow.add_conditional_edges(
+        "executor_tool_node", 
+        route_after_executor, # Re-uses the standard router's string outputs
+        {
+            "refactorer_node": "diplomat_node",          # If syntax breaks, send back to Diplomat
+            "test_engineer_node": "test_engineer_node",  # If coverage fails, send to Tests
+            "documenter_node": END,                      # We skip documentation for conflicts, exit on success
+            END: END                                     
+        }
+    )
+
+    return workflow
+
+
+def compile_app(checkpointer, workflow_builder=build_workflow):
+    """Compile a given graph with the given checkpointer.
 
     The graph always pauses *before* sandbox execution so the orchestration layer
     can post results to the PR and wait for a slash command (PRD §3.5, §3.6).
     """
-    return build_workflow().compile(
+    return workflow_builder().compile(
         checkpointer=checkpointer,
         interrupt_before=["executor_tool_node"],
     )
@@ -106,6 +133,7 @@ def compile_app(checkpointer):
 # disabled). The choice is left configurable here rather than hard-wired.
 
 _app_singleton = None
+_conflict_app_singleton = None
 _pg_pool = None
 
 
@@ -120,7 +148,6 @@ def _postgres_checkpointer():
         # Fall back to Django settings when running inside the app context.
         try:
             from django.conf import settings
-
             dsn = settings.POSTGRES_DSN
         except Exception as exc:  # pragma: no cover - misconfiguration guard
             raise RuntimeError("POSTGRES_DSN is not configured for the checkpointer.") from exc
@@ -137,17 +164,29 @@ def _postgres_checkpointer():
 
 
 def get_app():
-    """Return the process-wide compiled graph (lazy singleton)."""
+    """Return the process-wide compiled standard graph (lazy singleton)."""
     global _app_singleton
     if _app_singleton is None:
         backend = os.environ.get("CHECKPOINTER", "postgres").lower()
         if backend == "memory":
-            _app_singleton = compile_app(MemorySaver())
+            _app_singleton = compile_app(MemorySaver(), build_workflow)
         else:
-            _app_singleton = compile_app(_postgres_checkpointer())
+            _app_singleton = compile_app(_postgres_checkpointer(), build_workflow)
     return _app_singleton
 
 
+def get_conflict_app():
+    """Return the process-wide compiled conflict resolution graph (lazy singleton)."""
+    global _conflict_app_singleton
+    if _conflict_app_singleton is None:
+        backend = os.environ.get("CHECKPOINTER", "postgres").lower()
+        if backend == "memory":
+            _conflict_app_singleton = compile_app(MemorySaver(), build_conflict_workflow)
+        else:
+            _conflict_app_singleton = compile_app(_postgres_checkpointer(), build_conflict_workflow)
+    return _conflict_app_singleton
+
+
 def build_local_app():
-    """Compile a fresh graph with an in-memory checkpointer (CLI smoke test)."""
-    return compile_app(MemorySaver())
+    """Compile a fresh standard graph with an in-memory checkpointer (CLI smoke test)."""
+    return compile_app(MemorySaver(), build_workflow)
