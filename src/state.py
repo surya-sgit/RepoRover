@@ -34,6 +34,7 @@ class AgentState(TypedDict):
     existing_test_code: Optional[str]
     final_test_code: Optional[str]   # The new or modified test suite
     coverage_score: Optional[float]
+    pypi_dependencies: List[str]    
 
     # --- Human-in-the-Loop ---
     human_approval: bool

@@ -1,9 +1,8 @@
 import os
 import re
 import difflib
-from typing import List, Optional
+from typing import List, Optional, Dict
 import ast
-from typing import Dict
 
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -12,7 +11,7 @@ from langchain_core.messages import HumanMessage
 from src.state import AgentState
 from e2b_code_interpreter import Sandbox
 
-# --- 1. Strict Output Schema for Agent A (PRD §3.5, §6.2 structured output) ---
+# --- 1. Strict Output Schemas (PRD §3.5, §6.2 structured output) ---
 class CodeIssue(BaseModel):
     filepath: str = Field(description="The file where the issue was found")
     line_number: int = Field(description="Approximate line number of the issue")
@@ -23,6 +22,12 @@ class CodeIssue(BaseModel):
 class ReviewOutput(BaseModel):
     summary: str = Field(description="High-level summary of the code intent")
     issues: List[CodeIssue] = Field(description="List of specific technical issues found")
+
+class TestResult(BaseModel):
+    final_test_code: str = Field(description="The complete pytest suite.")
+    pypi_dependencies: List[str] = Field(
+        description="Exact PyPI package names required to execute the target code and tests (e.g., ['pyyaml', 'requests']). Empty list if standard library only."
+    )
 
 
 # --- 2. Per-tenant credential plumbing (BYOK, PRD §3.1) ---
@@ -248,7 +253,7 @@ def call_agent_b(state: AgentState, config=None):
     print("Agent B: Code refactored and diff generated.")
     return {
         "refactored_code": result_code,
-        "code_diff": diff_string, # <--- Pass diff to state
+        "code_diff": diff_string, 
         "iteration_count": state.get("iteration_count", 0),
     }
 
@@ -257,10 +262,18 @@ def call_executor(state: AgentState, config=None):
     print("EXECUTOR: Running pytest with Coverage in E2B Sandbox...")
 
     target_file = state["file_path"]
-    code_to_run = state.get("refactored_code")
+    code_to_run = state.get("refactored_code") or state.get("original_code")
     test_code = state.get("final_test_code")
     test_path = state.get("existing_test_path") or f"test_{target_file.split('/')[-1]}"
+    dependencies = state.get("pypi_dependencies", [])
     
+    if not test_code:
+        return {
+            "execution_status": "FAILURE", 
+            "execution_logs": "No tests provided.", 
+            "next_node": "test_engineer_node"
+        }
+
     repo_files = dict(state.get("repo_files", {}))
     repo_files[target_file] = code_to_run
     repo_files[test_path] = test_code
@@ -277,11 +290,16 @@ def call_executor(state: AgentState, config=None):
                 sbx.commands.run(f"mkdir -p {directory}")
             sbx.files.write(path, content)
 
-        # 2. Install testing requirements
+        # 2. Install agent-declared dependencies directly (Fixes Bug E)
+        if dependencies:
+            deps_string = " ".join(dependencies)
+            print(f"   Installing PyPI dependencies: {deps_string}")
+            sbx.commands.run(f"pip install {deps_string}")
+
+        # 3. Install testing requirements
         sbx.commands.run("pip install pytest pytest-cov")
 
-        # 3. Execute tests with Coverage thresholds
-        # Extract module name for coverage tracking (e.g. 'src/utils.py' -> 'src.utils')
+        # 4. Execute tests with Coverage thresholds
         cov_module = target_file.replace("/", ".").replace(".py", "")
         cmd = f"python -m pytest {test_path} --cov={cov_module} --cov-report=term-missing --cov-fail-under=80"
         
@@ -301,12 +319,15 @@ def call_executor(state: AgentState, config=None):
                 return {
                     "execution_status": "SUCCESS", 
                     "execution_logs": logs,
-                    "next_node": "agent_c" 
+                    "next_node": "documenter_node" 
                 }
 
             # If it fails, determine WHY and set the next_node
             failure_reason = ""
-            if "Coverage failure" in logs or "Required test coverage of" in logs:
+            if "ModuleNotFoundError" in logs:
+                failure_reason = "DEPENDENCY ERROR: A required module was missing. Update your pypi_dependencies list!"
+                next_agent = "test_engineer_node" # Send back to Test Engineer
+            elif "Coverage failure" in logs or "Required test coverage of" in logs:
                 failure_reason = "COVERAGE_TOO_LOW: You did not test enough of the code."
                 next_agent = "test_engineer_node" # Send back to Test Engineer
             else:
@@ -321,7 +342,8 @@ def call_executor(state: AgentState, config=None):
             }
 
     except Exception as e:
-        return {"execution_status": "FAILURE", "execution_logs": str(e)}
+        return {"execution_status": "FAILURE", "execution_logs": str(e), "next_node": "refactorer_node"}
+
 
 # --- 6. Agent C: Documenter ---
 def call_agent_c(state: AgentState, config=None):
@@ -353,25 +375,32 @@ def call_agent_c(state: AgentState, config=None):
         "documentation_diff": doc_update,
     }
 
+# --- 7. Agent T: Test Engineer (Bug E Fix) ---
 def call_agent_t(state: AgentState, config=None):
     llm = _build_llm(config)
-    print(f"--- Agent T: Writing/Modifying Tests ({llm.__class__.__name__}) ---")
+    print(f"--- Agent T: Writing/Modifying Tests & Resolving Dependencies ({llm.__class__.__name__}) ---")
 
-    refactored_code = state.get("refactored_code")
+    refactored_code = state.get("refactored_code") or state.get("original_code")
     existing_test = state.get("existing_test_code")
+    execution_logs = state.get("execution_logs", "")
     
+    structured_llm = llm.with_structured_output(TestResult)
+
     prompt = f"""
-    You are a Senior SDET (Software Development Engineer in Test).
+    You are a Senior SDET (Software Development Engineer in Test). Ensure the following code runs.
     Agent B has just refactored the following file ({state['file_path']}):
     
     ```python
     {refactored_code}
     ```
+    
+    PREVIOUS TEST EXECUTION LOGS (If any tests failed or dependencies were missing, fix them):
+    {execution_logs}
     """
 
     if existing_test:
         prompt += f"""
-        EXISTING TEST SUITE FOUND ({state['existing_test_path']}):
+        EXISTING TEST SUITE FOUND ({state.get('existing_test_path')}):
         ```python
         {existing_test}
         ```
@@ -390,9 +419,10 @@ def call_agent_t(state: AgentState, config=None):
         3. Return the FULL test script.
         """
 
-    response = llm.invoke([HumanMessage(content=prompt)])
-    test_code = response.content.strip().replace("```python", "").replace("```", "")
+    response = structured_llm.invoke([HumanMessage(content=prompt)])
 
     return {
-        "final_test_code": test_code
+        "final_test_code": response.final_test_code,
+        "pypi_dependencies": response.pypi_dependencies
     }
+
