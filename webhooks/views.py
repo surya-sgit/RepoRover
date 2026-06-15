@@ -21,7 +21,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from engine.slash import parse_command
-from engine.tasks import handle_pull_request, handle_issue_comment
+from engine.tasks import handle_pull_request, handle_issue_comment, handle_review_comment
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +56,8 @@ def github_webhook(request):
         handle_pull_request.delay(payload)
         return JsonResponse({"status": "queued", "event": "pull_request"})
 
+    # Handles general PR comments
     if event == "issue_comment" and payload.get("action") == "created":
-        # Only enqueue if the comment is one of our slash commands and is on a PR.
         body = payload.get("comment", {}).get("body", "")
         is_pr = "pull_request" in payload.get("issue", {})
         if is_pr and parse_command(body) is not None:
@@ -65,5 +65,12 @@ def github_webhook(request):
             return JsonResponse({"status": "queued", "event": "issue_comment"})
         return JsonResponse({"status": "ignored", "reason": "not a command"})
 
-    # 3. Acknowledge unsupported events without doing work.
+    # Handles INLINE file-specific review comments (Option B)
+    if event == "pull_request_review_comment" and payload.get("action") == "created":
+        body = payload.get("comment", {}).get("body", "")
+        if parse_command(body) is not None:
+            handle_review_comment.delay(payload)
+            return JsonResponse({"status": "queued", "event": "pull_request_review_comment"})
+        return JsonResponse({"status": "ignored", "reason": "not a command"})
+
     return JsonResponse({"status": "ignored", "event": event})

@@ -63,6 +63,26 @@ class GitHubConnector:
         comment = issue.create_comment(body)
         return comment.id
 
+    def post_inline_pr_comment(self, pr_number: int, commit_sha: str, file_path: str, body: str) -> int:
+        """
+        Attempts to post an inline review comment. Falls back to standard comment if the line position is invalid.
+        """
+        pr = self.repo.get_pull(pr_number)
+        try:
+            # Position 1 targets the first line of the diff patch
+            comment = pr.create_review_comment(
+                body=body,
+                commit_id=commit_sha,
+                path=file_path,
+                position=1 
+            )
+            return comment.id
+        except Exception as e:
+            # Fallback if position=1 is rejected by GitHub API
+            print(f"Inline comment failed for {file_path}, falling back to PR thread: {e}")
+            fallback_body = f"**[Inline notice for `{file_path}`]**\n\n{body}"
+            return self.post_pr_comment(pr_number, fallback_body)
+
     def get_latest_commit_sha(self, pr_number: int) -> str:
         """Return the head SHA of a PR, used to guard against stale executions (PRD §4.3)."""
         return self.repo.get_pull(pr_number).head.sha
@@ -79,8 +99,8 @@ class GitHubConnector:
         for file in pr.get_files():
             files_changed.append({
                 "filename": file.filename,
-                "status": file.status, # added, modified, removed
-                "patch": file.patch,   # The actual diff (changes)
+                "status": file.status,
+                "patch": file.patch,
                 "raw_url": file.raw_url
             })
             

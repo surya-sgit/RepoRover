@@ -130,6 +130,11 @@ class ReviewSession(models.Model):
         related_name="sessions",
     )
     pr_number = models.IntegerField()
+    file_path = models.CharField(
+        max_length=500, 
+        default="", 
+        help_text="The specific file this review session is targeting."
+    )
     commit_sha = models.CharField(
         max_length=64,
         help_text="Latest commit reviewed; actions only run on the latest SHA.",
@@ -149,12 +154,12 @@ class ReviewSession(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=["repo_settings", "pr_number"]),
+            models.Index(fields=["repo_settings", "pr_number", "file_path"]),
             models.Index(fields=["current_status"]),
         ]
 
     def __str__(self) -> str:
         return (
             f"ReviewSession(repo={self.repo_settings.repository_name}, "
-            f"pr={self.pr_number}, status={self.current_status})"
+            f"pr={self.pr_number}, file={self.file_path}, status={self.current_status})"
         )

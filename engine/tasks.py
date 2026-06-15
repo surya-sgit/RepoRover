@@ -26,7 +26,7 @@ from engine.errors import (
 )
 from engine.github_comments import render_review_comment, render_final_comment, BOT_MARKER
 from engine.slash import parse_command, APPROVE, REJECT, SKIP
-from tenancy.models import ReviewSession
+from tenancy.models import OrganizationConfig, RepoSettings, ReviewSession
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,40 @@ CONCURRENCY_RETRY_DELAY = 30
 # --------------------------------------------------------------------------- #
 # Pull request -> start a review job
 # --------------------------------------------------------------------------- #
+
+def _trigger_pr_fanout(gh, org, repo, pr_number: int, head_sha: str):
+    """Helper: Spawns concurrent review tasks for all Python files in a PR."""
+    pr_data = gh.get_pr_details(pr_number)
+    
+    # 1. Gather all Python files in the PR
+    target_files = [
+        f for f in pr_data["files"] 
+        if f["filename"].endswith(".py") and f["status"] != "removed"
+    ]
+
+    if not target_files:
+        gh.post_pr_comment(
+            pr_number,
+            f"{BOT_MARKER}\nRepoRover found no reviewable Python files in this PR.",
+        )
+        return
+
+    # 2. Fan-out: Create a separate session & task for every file
+    for target_file in target_files:
+        session = ReviewSession.objects.create(
+            repo_settings=repo,
+            pr_number=pr_number,
+            file_path=target_file["filename"], # Track specific file
+            commit_sha=head_sha,
+            current_status=ReviewSession.Status.ANALYZING,
+            active_jobs=1,
+        )
+        process_file_review.delay(session.id, org.id, repo.id)
+
+
 @shared_task(bind=True, max_retries=None)
 def handle_pull_request(self, payload: dict):
+    """Triggered on PR opened or synchronize."""
     action = payload.get("action")
     if action not in ("opened", "synchronize"):
         return
@@ -51,48 +83,32 @@ def handle_pull_request(self, payload: dict):
 
     org, repo = services.resolve_tenant(installation_id, repo_full_name)
     if not org or not repo:
-        logger.info("No tenant config for %s (installation %s); ignoring.",
-                    repo_full_name, installation_id)
         return
     if not org.has_keys:
-        logger.info("Tenant %s has no BYOK keys configured; ignoring.", repo_full_name)
         return
 
-    # --- Concurrency governance (PRD §5.1): FIFO-style delayed retry at cap. ---
     if services.at_capacity(repo):
-        logger.info("Repo %s at concurrency cap; requeueing PR #%s.",
-                    repo_full_name, pr_number)
         raise self.retry(countdown=CONCURRENCY_RETRY_DELAY)
 
-    session = ReviewSession.objects.create(
-        repo_settings=repo,
-        pr_number=pr_number,
-        commit_sha=head_sha,
-        current_status=ReviewSession.Status.ANALYZING,
-        active_jobs=1,
-    )
-
-    _start_review(session, org, repo)
+    gh = services.build_connector(org, repo)
+    _trigger_pr_fanout(gh, org, repo, pr_number, head_sha)
 
 
-def _start_review(session: ReviewSession, org, repo):
-    """Run Agents A→B to the pre-sandbox pause and post the proposal."""
+@shared_task
+def process_file_review(session_id: int, org_id: int, repo_id: int):
+    """Executes the Agents A -> B loop for a single file concurrently."""
+    session = ReviewSession.objects.get(id=session_id)
+    org = OrganizationConfig.objects.get(id=org_id)
+    repo = RepoSettings.objects.get(id=repo_id)
+    
     gh = services.build_connector(org, repo)
     pr_number = session.pr_number
+    filename = session.file_path
 
     try:
         pr_data = gh.get_pr_details(pr_number)
-        target = services.select_target_file(pr_data)
-        if not target:
-            gh.post_pr_comment(
-                pr_number,
-                f"{BOT_MARKER}\nRepoRover found no reviewable Python files in this PR.",
-            )
-            _complete(session)
-            return
-
         repo_map = gh.get_repo_map(pr_data["files"], pr_data["head_branch"])
-        filename = target["filename"]
+        
         content = repo_map.get(filename) or gh.get_file_content(
             filename, branch=pr_data["head_branch"]
         )
@@ -112,6 +128,7 @@ def _start_review(session: ReviewSession, org, repo):
         llm_instance = services.get_tenant_llm(org)
         thread_id = str(session.langgraph_thread_id)
         config = services.tenant_runtime_config(org, thread_id)
+        
         initial_state = {
             "repo_path": repo.repository_name,
             "file_path": filename,
@@ -132,7 +149,7 @@ def _start_review(session: ReviewSession, org, repo):
 
         _report_pause(gh, session, app, config, filename)
 
-    except Exception as exc:  # noqa: BLE001 - provider failures handled below
+    except Exception as exc: 
         _handle_failure(gh, session, pr_number, exc)
 
 
@@ -140,64 +157,42 @@ def _start_review(session: ReviewSession, org, repo):
 # Issue comment -> resume a paused review along a slash-command path
 # --------------------------------------------------------------------------- #
 @shared_task(bind=True)
-def handle_issue_comment(self, payload: dict):
+def handle_review_comment(self, payload: dict):
+    """Handles commands sent to INLINE review threads (e.g. /approve specific file)."""
     if payload.get("action") != "created":
         return
-    if "pull_request" not in payload.get("issue", {}):
-        return  # comment on a plain issue, not a PR
 
     body = payload["comment"].get("body", "")
     if BOT_MARKER in body:
-        return  # ignore our own comments
+        return  
+        
     cmd = parse_command(body)
     if cmd is None:
-        return  # not a slash command
+        return  
 
     installation_id = payload["installation"]["id"]
     repo_full_name = payload["repository"]["full_name"]
-    pr_number = payload["issue"]["number"]
+    pr_number = payload["pull_request"]["number"] # <--- Inline events use pull_request directly
+    target_file = payload["comment"]["path"]      # GitHub explicitly gives us the path
 
     org, repo = services.resolve_tenant(installation_id, repo_full_name)
     if not org or not repo:
         return
 
-    gh = services.build_connector(org, repo)
-
-    # ───────────────────────────────────────────────────────────────────
-    # INTERCEPT AUTOMATED FRESH REVIEW TRIGGER
-    # ───────────────────────────────────────────────────────────────────
-    if cmd.command == "review":
-        if services.at_capacity(repo):
-            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at its concurrency capacity loop limit.")
-            return
-
-        latest_sha = gh.get_latest_commit_sha(pr_number)
-        
-        # Spawn an entirely new review session record mapping the current head state
-        session = ReviewSession.objects.create(
-            repo_settings=repo,
-            pr_number=pr_number,
-            commit_sha=latest_sha,
-            current_status=ReviewSession.Status.ANALYZING,
-            active_jobs=1,
-        )
-        
-        _start_review(session, org, repo)
-        return
-    # ───────────────────────────────────────────────────────────────────
-
-    # The existing lookups for AWAITING_HUMAN continue safely down here...
+    # Find the specific paused thread for THIS file
     session = (
         ReviewSession.objects.filter(
             repo_settings=repo,
             pr_number=pr_number,
+            file_path=target_file,
             current_status=ReviewSession.Status.AWAITING_HUMAN,
         )
         .order_by("-updated_at")
         .first()
     )
+    
     if not session:
-        return  # nothing is awaiting input on this PR
+        return  
 
     gh = services.build_connector(org, repo)
 
@@ -205,13 +200,15 @@ def handle_issue_comment(self, payload: dict):
     # this paused session.
     try:
         latest_sha = gh.get_latest_commit_sha(pr_number)
-    except Exception:  # noqa: BLE001
+    except Exception:  
         latest_sha = session.commit_sha
+        
     if latest_sha != session.commit_sha:
-        gh.post_pr_comment(
+        gh.post_inline_pr_comment(
             pr_number,
-            f"{BOT_MARKER}\nThis command targets an outdated commit; a newer push "
-            "has started a fresh review.",
+            latest_sha,
+            target_file,
+            f"{BOT_MARKER}\nThis command targets an outdated commit; a newer push has started a fresh review.",
         )
         return
 
@@ -219,7 +216,6 @@ def handle_issue_comment(self, payload: dict):
     config = services.tenant_runtime_config(org, thread_id)
     app = get_app()
     snapshot = app.get_state(config)
-    filename = snapshot.values.get("file_path", "")
 
     try:
         if cmd.command == APPROVE:
@@ -233,6 +229,7 @@ def handle_issue_comment(self, payload: dict):
                     "execution_status": "FAILURE",
                     "execution_logs": f"HUMAN REJECTION: {cmd.feedback}",
                     "iteration_count": snapshot.values.get("iteration_count", 0),
+                    "next_node": "refactorer_node",
                 },
                 as_node="executor_tool_node",
             )
@@ -244,28 +241,68 @@ def handle_issue_comment(self, payload: dict):
                 as_node="executor_tool_node",
             )
 
-        # Resume: run from the pause to the next stop (final or another pause).
         for _ in app.stream(None, config=config):
             pass
 
-        _report_pause(gh, session, app, config, filename)
+        _report_pause(gh, session, app, config, target_file)
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  
         _handle_failure(gh, session, pr_number, exc)
 
 
+@shared_task(bind=True)
+def handle_issue_comment(self, payload: dict):
+    """Handles global PR comments, specifically restoring the /review command."""
+    if payload.get("action") != "created":
+        return
+        
+    if "pull_request" not in payload.get("issue", {}):
+        return  # This was a comment on a standard issue, not a PR
+        
+    body = payload["comment"].get("body", "")
+    if BOT_MARKER in body:
+        return  
+
+    cmd = parse_command(body)
+    if cmd is None:
+        return  
+
+    installation_id = payload["installation"]["id"]
+    repo_full_name = payload["repository"]["full_name"]
+    pr_number = payload["issue"]["number"] # <--- Global comments use the issue envelope
+
+    org, repo = services.resolve_tenant(installation_id, repo_full_name)
+    if not org or not repo:
+        return
+
+    gh = services.build_connector(org, repo)
+
+    # ───────────────────────────────────────────────────────────────────
+    # RESTORED: INTERCEPT AUTOMATED FRESH REVIEW TRIGGER
+    # ───────────────────────────────────────────────────────────────────
+    if cmd.command == "review":
+        if services.at_capacity(repo):
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at its concurrency capacity loop limit.")
+            return
+
+        latest_sha = gh.get_latest_commit_sha(pr_number)
+        
+        # Trigger the multi-file fan-out using the new helper
+        _trigger_pr_fanout(gh, org, repo, pr_number, latest_sha)
+        return
 # --------------------------------------------------------------------------- #
 # Shared reporting helpers
 # --------------------------------------------------------------------------- #
 def _report_pause(gh, session: ReviewSession, app, config, filename: str):
-    """Inspect the graph: if finished, post final; if paused, post a new proposal."""
+    """Inspect the graph: if finished, post final; if paused, post a new proposal inline."""
     snapshot = app.get_state(config)
     values = snapshot.values
 
     if not snapshot.next:
-        # Graph reached END — sandbox/docs complete.
-        gh.post_pr_comment(
+        gh.post_inline_pr_comment(
             session.pr_number,
+            session.commit_sha,
+            filename,
             render_final_comment(
                 filename=filename,
                 execution_status=values.get("execution_status", "UNKNOWN"),
@@ -276,9 +313,11 @@ def _report_pause(gh, session: ReviewSession, app, config, filename: str):
         _complete(session)
         return
 
-    # Paused again before the sandbox (initial proposal or a post-retry revision).
-    gh.post_pr_comment(
+    # Post an INLINE comment for the specific file
+    gh.post_inline_pr_comment(
         session.pr_number,
+        session.commit_sha,
+        filename,
         render_review_comment(
             filename=filename,
             intent_summary=values.get("intent_summary", ""),
@@ -299,7 +338,7 @@ def _handle_failure(gh, session: ReviewSession, pr_number: int, exc: Exception):
         logger.warning("Provider error for PR #%s: %s", pr_number, diagnostic)
         try:
             gh.post_pr_comment(pr_number, execution_paused_comment(diagnostic))
-        except Exception:  # noqa: BLE001
+        except Exception:  
             logger.exception("Failed to post Execution Paused notice.")
         _complete(session)
         return

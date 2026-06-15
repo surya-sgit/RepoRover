@@ -121,15 +121,3 @@ def tenant_runtime_config(org, thread_id):
             "gemini_model": org.llm_model_name,
         }
     }
-
-def select_target_file(pr_data: dict) -> Optional[dict]:
-    """Pick the changed Python file to review.
-
-    Phase 1.0 reviews the first non-removed Python file per PR so the
-    human-in-the-loop gate maps cleanly to a single PR comment thread.
-    Multi-file fan-out with disambiguated slash commands is future work.
-    """
-    for f in pr_data["files"]:
-        if f["filename"].endswith(".py") and f["status"] != "removed":
-            return f
-    return None
