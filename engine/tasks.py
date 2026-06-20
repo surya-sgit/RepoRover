@@ -11,11 +11,11 @@ All heavy work (hydration, LLM, sandbox) lives here, off the request thread, so
 the webhook view can return HTTP 200 within GitHub's 10s budget.
 """
 from __future__ import annotations
-
+import re
 import logging
 
 from celery import shared_task
-
+from django.db import transaction
 from src.graph import get_app, get_conflict_app
 from engine import services
 from engine.errors import (
@@ -60,12 +60,12 @@ def _trigger_pr_fanout(gh, org, repo, pr_number: int, head_sha: str):
         session = ReviewSession.objects.create(
             repo_settings=repo,
             pr_number=pr_number,
-            file_path=target_file["filename"], # Track specific file
+            file_path=target_file["filename"],
             commit_sha=head_sha,
             current_status=ReviewSession.Status.ANALYZING,
             active_jobs=1,
         )
-        process_file_review.delay(session.id, org.id, repo.id)
+        process_file_review.delay(session.id)
 
 
 def _trigger_conflict_resolution(gh, org, repo, pr_number: int, target_file: str):
@@ -173,221 +173,176 @@ def handle_pull_request(self, payload: dict):
     _trigger_pr_fanout(gh, org, repo, pr_number, head_sha)
 
 
-@shared_task
-def process_file_review(session_id: int, org_id: int, repo_id: int):
-    """Executes the Agents A -> B -> T loop for a single file concurrently."""
-    session = ReviewSession.objects.get(id=session_id)
-    org = OrganizationConfig.objects.get(id=org_id)
-    repo = RepoSettings.objects.get(id=repo_id)
+@shared_task(bind=True)
+def process_file_review(self, session_id: int, command: str = None, feedback: str = None):
+    """Executes or Resumes the Agents A -> B -> T loop for a single file context."""
+    session = ReviewSession.objects.select_related('repo_settings__org_config').get(id=session_id)
+    repo = session.repo_settings
+    org = repo.org_config
     
     gh = services.build_connector(org, repo)
     pr_number = session.pr_number
     filename = session.file_path
 
     try:
-        pr_data = gh.get_pr_details(pr_number)
-        repo_map = gh.get_repo_map(pr_data["files"], pr_data["head_branch"])
-        
-        content = repo_map.get(filename) or gh.get_file_content(
-            filename, branch=pr_data["head_branch"]
-        )
-        
-        # Test Discovery
-        expected_test_name = f"test_{filename.split('/')[-1]}"
-        alt_test_name = f"{filename.split('/')[-1].replace('.py', '')}_test.py"
-        
-        existing_test_path = None
-        existing_test_code = None
-        for filepath, f_content in repo_map.items():
-            if filepath.endswith(expected_test_name) or filepath.endswith(alt_test_name):
-                existing_test_path = filepath
-                existing_test_code = f_content
-                break
-
         llm_instance = services.get_tenant_llm(org)
         thread_id = str(session.langgraph_thread_id)
         config = services.tenant_runtime_config(org, thread_id)
-        
-        initial_state = {
-            "repo_path": repo.repository_name,
-            "file_path": filename,
-            "file_content": content,
-            "original_code": content,
-            "repo_files": repo_map,
-            "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
-            "iteration_count": 0,
-            "existing_test_path": existing_test_path,
-            "existing_test_code": existing_test_code,
-        }
         config["configurable"]["llm"] = llm_instance
-        app = get_app()
         
-        # Runs reviewer -> refactorer -> test engineer, then pauses before executor_tool_node.
-        for _ in app.stream(initial_state, config=config):
-            pass
+        # Determine active graph deployment mapping
+        if command == "commit_merge":
+            app = get_conflict_app()
+        else:
+            app = get_app()
 
-        _report_pause(gh, session, app, config, filename)
+        # ===================================================================
+        # PHASE 1: INITIAL PAUSE TRIGGER (Fresh Review)
+        # ===================================================================
+        # If command is None (from fanout) or "review"
+        if command in (None, "review"):
+            pr_data = gh.get_pr_details(pr_number)
+            repo_map = gh.get_repo_map(pr_data["files"], pr_data["head_branch"])
+            content = repo_map.get(filename) or gh.get_file_content(filename, branch=pr_data["head_branch"])
+            
+            expected_test_name = f"test_{filename.split('/')[-1]}"
+            alt_test_name = f"{filename.split('/')[-1].replace('.py', '')}_test.py"
+            
+            existing_test_path, existing_test_code = None, None
+            for filepath, f_content in repo_map.items():
+                if filepath.endswith(expected_test_name) or filepath.endswith(alt_test_name):
+                    existing_test_path = filepath
+                    existing_test_code = f_content
+                    break
 
-    except Exception as exc: 
-        _handle_failure(gh, session, pr_number, exc)
+            initial_state = {
+                "repo_path": repo.repository_name,
+                "file_path": filename,
+                "file_content": content,
+                "original_code": content,
+                "repo_files": repo_map,
+                "pr_description": f"Title: {pr_data['title']}\nDesc: {pr_data['description']}",
+                "iteration_count": 0,
+                "existing_test_path": existing_test_path,
+                "existing_test_code": existing_test_code,
+            }
+            
+            for _ in app.stream(initial_state, config=config): pass
+            _report_pause(gh, session, app, config, filename)
+            
+            # CRITICAL: Return here so it does not fall into Phase 2
+            return
 
-
-# --------------------------------------------------------------------------- #
-# Issue comment -> resume a paused review along a slash-command path
-# --------------------------------------------------------------------------- #
-@shared_task(bind=True)
-def handle_review_comment(self, payload: dict):
-    """Handles commands sent to INLINE review threads (e.g. /approve specific file or /resolve)."""
-    if payload.get("action") != "created":
-        return
-
-    body = payload["comment"].get("body", "")
-    if BOT_MARKER in body:
-        return  
-        
-    cmd = parse_command(body)
-    if cmd is None:
-        return  
-
-    installation_id = payload["installation"]["id"]
-    repo_full_name = payload["repository"]["full_name"]
-    pr_number = payload["pull_request"]["number"] 
-    target_file = payload["comment"]["path"]      
-
-    org, repo = services.resolve_tenant(installation_id, repo_full_name)
-    if not org or not repo:
-        return
-
-    gh = services.build_connector(org, repo)
-
-    # ----------------------------------------------------------------------- #
-    # FRESH WORKFLOW: Resolve Merge Conflict
-    # ----------------------------------------------------------------------- #
-    if cmd.command == "resolve":
-        _trigger_conflict_resolution(gh, org, repo, pr_number, target_file)
-        return
-
-    # ----------------------------------------------------------------------- #
-    # RESUME WORKFLOW: Find the paused session for this specific file
-    # ----------------------------------------------------------------------- #
-    session = (
-        ReviewSession.objects.filter(
-            repo_settings=repo,
-            pr_number=pr_number,
-            file_path=target_file,
-            current_status=ReviewSession.Status.AWAITING_HUMAN,
-        )
-        .order_by("-updated_at")
-        .first()
-    )
-    
-    if not session:
-        return  
-
-    try:
-        latest_sha = gh.get_latest_commit_sha(pr_number)
-    except Exception:  
-        latest_sha = session.commit_sha
-        
-    if latest_sha != session.commit_sha:
-        gh.post_inline_pr_comment(
-            pr_number,
-            latest_sha,
-            target_file,
-            f"{BOT_MARKER}\nThis command targets an outdated commit; a newer push has started a fresh review.",
-        )
-        return
-
-    thread_id = str(session.langgraph_thread_id)
-    config = services.tenant_runtime_config(org, thread_id)
-    config["configurable"]["llm"] = services.get_tenant_llm(org)
-
-    # Hybrid Approval Path (Agent D / Conflict Graph)
-    if cmd.command == "commit_merge":
-        app = get_conflict_app()
+        # ===================================================================
+        # PHASE 2: RESUME GRAPH WORKFLOWS (Approve/Reject/Skip Engine)
+        # ===================================================================
         snapshot = app.get_state(config)
-        vals = snapshot.values
-        pr_data = gh.get_pr_details(pr_number)
-        
-        # 1. Push the fixed code file
-        gh.push_commit(
-            pr_data["head_branch"], 
-            vals["file_path"], 
-            vals.get("refactored_code", ""), 
-            f"RepoRover: Resolved merge conflict in {vals['file_path']}"
-        )
-        
-        # 2. Strict Append Test Rule
-        existing_test_path = vals.get("existing_test_path")
-        if existing_test_path and vals.get("final_test_code"):
+
+        if command == "commit_merge":
+            vals = snapshot.values
+            pr_data = gh.get_pr_details(pr_number)
+            
             gh.push_commit(
-                pr_data["head_branch"], 
-                existing_test_path, 
-                vals["final_test_code"], 
-                f"RepoRover: Updated tests for {vals['file_path']} conflict resolution"
+                pr_data["head_branch"], vals["file_path"], vals.get("refactored_code", ""), 
+                f"RepoRover: Resolved merge conflict in {vals['file_path']}"
             )
             
-        gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nConflict resolved and successfully committed to the branch.")
-        _complete(session)
-        return
-
-    # Standard Execution Path (Agent A->B->T Graph)
-    app = get_app()
-    snapshot = app.get_state(config)
-
-    try:
-        if cmd.command == APPROVE:
-            session.current_status = ReviewSession.Status.EXECUTING
+            if vals.get("existing_test_path") and vals.get("final_test_code"):
+                gh.push_commit(
+                    pr_data["head_branch"], vals["existing_test_path"], vals["final_test_code"], 
+                    f"RepoRover: Updated tests for {vals['file_path']} conflict resolution"
+                )
+                
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nConflict resolved and successfully committed to the branch.")
+            session.current_status = 'COMPLETED'
             session.save(update_fields=["current_status", "updated_at"])
+            return
 
-        elif cmd.command == REJECT:
+        elif command == "approve":
+            # State implementation for entering E2B Sandbox node loop
+            app.update_state(config, {"execution_status": "APPROVED"}, as_node="executor_tool_node")
+
+        elif command == "reject":
             app.update_state(
                 config,
                 {
                     "execution_status": "FAILURE",
-                    "execution_logs": f"HUMAN REJECTION: {cmd.feedback}",
+                    "execution_logs": f"HUMAN REJECTION: {feedback}",
                     "iteration_count": snapshot.values.get("iteration_count", 0),
                     "next_node": "refactorer_node",
                 },
                 as_node="executor_tool_node",
             )
 
-        elif cmd.command == SKIP:
+        elif command == "skip":
             app.update_state(
                 config,
                 {"execution_status": "SKIPPED_TO_DOCS", "execution_logs": "User skipped."},
                 as_node="executor_tool_node",
             )
 
-        for _ in app.stream(None, config=config):
-            pass
+        # Stream resumption through the rest of the node graph steps
+        for _ in app.stream(None, config=config): pass
 
-        _report_pause(gh, session, app, config, target_file)
+        # Re-evaluate final state status context
+        updated_snapshot = app.get_state(config)
+        if updated_snapshot.values.get("next_node") == "refactorer_node" or updated_snapshot.next:
+            session.current_status = 'AWAITING_HUMAN'
+            session.save(update_fields=["current_status", "updated_at"])
+            _report_pause(gh, session, app, config, filename)
+        else:
+            session.current_status = 'COMPLETED'
+            session.save(update_fields=["current_status", "updated_at"])
 
-    except Exception as exc:  
+    except Exception as exc: 
         _handle_failure(gh, session, pr_number, exc)
 
+# --------------------------------------------------------------------------- #
+# Issue comment -> resume a paused review along a slash-command path
+# --------------------------------------------------------------------------- #
+
+def parse_command(body: str):
+    """
+    Parses commands while ignoring GitHub quote-replies (lines starting with '>').
+    Returns a tuple of (command_name, feedback_string).
+    """
+    clean_lines = [line.strip() for line in body.split('\n') if not line.strip().startswith('>')]
+    clean_text = '\n'.join(clean_lines).strip()
+    
+    if not clean_text:
+        return None, None
+        
+    match = re.search(r'^/(approve|reject|resolve|skip|commit_merge|review)(?:\s+(.*))?', clean_text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    if match:
+        return match.group(1).lower(), (match.group(2) or "").strip()
+    return None, None
 
 @shared_task(bind=True)
 def handle_issue_comment(self, payload: dict):
-    """Handles commands sent to the global PR conversation thread."""
+    """Unified handler for both global PR timeline comments and inline review threads."""
     if payload.get("action") != "created":
         return
         
-    if "pull_request" not in payload.get("issue", {}):
-        return  
+    pr_number = payload.get("issue", {}).get("number") or payload.get("pull_request", {}).get("number")
+    if not pr_number:
+        return
         
     body = payload["comment"].get("body", "")
-    if BOT_MARKER in body:
+    
+    # Ignore webhooks triggered by bots/apps to prevent infinite loops
+    sender_type = payload.get("sender", {}).get("type", "")
+    if sender_type == "Bot":
         return  
 
-    cmd = parse_command(body)
-    if cmd is None:
+    cmd_name, feedback = parse_command(body)
+    
+    # --- TEMPORARY DEBUGGING PRINT ---
+    print(f"DEBUG: Extracted Command -> {cmd_name} | Feedback -> {feedback}")
+    if not cmd_name:
         return  
 
     installation_id = payload["installation"]["id"]
     repo_full_name = payload["repository"]["full_name"]
-    pr_number = payload["issue"]["number"]
 
     org, repo = services.resolve_tenant(installation_id, repo_full_name)
     if not org or not repo:
@@ -395,28 +350,85 @@ def handle_issue_comment(self, payload: dict):
 
     gh = services.build_connector(org, repo)
 
-    # ───────────────────────────────────────────────────────────────────
-    # RESTORED: INTERCEPT AUTOMATED FRESH REVIEW TRIGGER
-    # ───────────────────────────────────────────────────────────────────
-    if cmd.command == "review":
-        if services.at_capacity(repo):
-            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at its concurrency capacity loop limit.")
-            return
+    # 1. Context Scoping
+    is_inline = "comment" in payload and "path" in payload["comment"]
+    inline_file = payload["comment"]["path"] if is_inline else None
 
+    # 2. Handle Fresh Workflow Intercepts First
+    if cmd_name == "review":
+        if services.at_capacity(repo):
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at concurrency loop capacity limit.")
+            return
         latest_sha = gh.get_latest_commit_sha(pr_number)
         _trigger_pr_fanout(gh, org, repo, pr_number, latest_sha)
         return
 
-    if cmd.command == "resolve":
-        target_file = cmd.feedback.strip() if cmd.feedback else None
-        if not target_file:
-            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nPlease provide the filename you wish to resolve, e.g., `/resolve src/utils.py`")
+    if cmd_name == "resolve":
+        target = inline_file or (feedback.strip() if feedback else None)
+        if not target:
+            gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nPlease specify a filename: `/resolve path/to/file.py`")
             return
-            
-        _trigger_conflict_resolution(gh, org, repo, pr_number, target_file)
+        _trigger_conflict_resolution(gh, org, repo, pr_number, target)
         return
 
+    # Guard Rails against Global Conflict Commits
+    if cmd_name == "commit_merge" and not is_inline:
+        gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nThe `/commit_merge` command must be executed directly inside an inline conflict thread.")
+        return
 
+    # 3. Target Pending Sessions
+    if is_inline:
+        sessions = ReviewSession.objects.filter(
+            repo_settings=repo, pr_number=pr_number, file_path=inline_file, current_status='AWAITING_HUMAN'
+        )
+    else:
+        sessions = ReviewSession.objects.filter(
+            repo_settings=repo, pr_number=pr_number, current_status='AWAITING_HUMAN'
+        )
+
+    if not sessions.exists():
+        return
+
+    # 4. Enforce Stale Commit Check Across All Target Sessions
+    try:
+        latest_sha = gh.get_latest_commit_sha(pr_number)
+    except Exception:
+        latest_sha = None
+
+    for s in sessions:
+        if latest_sha and latest_sha != s.commit_sha:
+            msg = f"{BOT_MARKER}\nCommand rejected for `{s.file_path}`. This session targets an outdated commit."
+            if is_inline:
+                gh.post_inline_pr_comment(pr_number, latest_sha, inline_file, msg)
+            else:
+                gh.post_pr_comment(pr_number, msg)
+            return
+
+    session_count = sessions.count()
+
+    # 5. Enforce Global Rejection Feedback Rule
+    if cmd_name == "reject" and not is_inline and session_count > 1:
+        feedback_lines = [line for line in feedback.split('\n') if line.strip()]
+        if len(feedback_lines) < session_count:
+            gh.post_pr_comment(
+                pr_number, 
+                f"{BOT_MARKER}\nYou are globally rejecting {session_count} files. Please provide separate reasons for rejection for each file (one per line), or reply directly to their inline threads."
+            )
+            return
+
+    # 6. Process Valid Sessions Loop
+    # Perform a single bulk database update to avoid gevent socket collisions
+    sessions.update(current_status='EXECUTING')
+
+    # Now dispatch the Celery tasks in memory
+    for idx, s in enumerate(sessions):
+        # Distribute parsed feedback if bulk rejecting
+        current_feedback = feedback
+        if cmd_name == "reject" and not is_inline and session_count > 1:
+            current_feedback = feedback_lines[idx]
+
+        # Route to execution engine
+        process_file_review.delay(s.id, command=cmd_name, feedback=current_feedback)
 # --------------------------------------------------------------------------- #
 # Shared reporting helpers
 # --------------------------------------------------------------------------- #

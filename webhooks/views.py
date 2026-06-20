@@ -3,7 +3,7 @@
 A single endpoint that must, within GitHub's 10-second delivery budget:
   1. Verify the HMAC-SHA256 payload signature.
   2. Accept only ``pull_request`` (opened/synchronize) and ``issue_comment``
-     (created) events.
+     / ``pull_request_review_comment`` (created) events.
   3. Enqueue the work onto Celery (Redis) and return HTTP 200 immediately.
 
 No hydration, LLM, or sandbox work happens inline.
@@ -21,7 +21,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from engine.slash import parse_command
-from engine.tasks import handle_pull_request, handle_issue_comment, handle_review_comment
+from engine.tasks import handle_pull_request, handle_issue_comment
 
 logger = logging.getLogger(__name__)
 
@@ -50,27 +50,28 @@ def github_webhook(request):
     except (ValueError, UnicodeDecodeError):
         return HttpResponseBadRequest("Malformed JSON payload")
 
-    # 2. Filter to the two supported events; everything else is acknowledged
-    #    and dropped (a 200 keeps GitHub from retrying).
+    # 2. Routing Engine
+    
+    # Handles Fresh PR Opens/Syncs
     if event == "pull_request" and payload.get("action") in ("opened", "synchronize"):
         handle_pull_request.delay(payload)
         return JsonResponse({"status": "queued", "event": "pull_request"})
 
-    # Handles general PR comments
+    # Handles general PR timeline conversation entries (Global)
     if event == "issue_comment" and payload.get("action") == "created":
         body = payload.get("comment", {}).get("body", "")
         is_pr = "pull_request" in payload.get("issue", {})
         if is_pr and parse_command(body) is not None:
             handle_issue_comment.delay(payload)
             return JsonResponse({"status": "queued", "event": "issue_comment"})
-        return JsonResponse({"status": "ignored", "reason": "not a command"})
+        return JsonResponse({"status": "ignored", "reason": "not a valid command"})
 
-    # Handles INLINE file-specific review comments (Option B)
+    # Handles INLINE file-specific review comments (Granular)
     if event == "pull_request_review_comment" and payload.get("action") == "created":
         body = payload.get("comment", {}).get("body", "")
         if parse_command(body) is not None:
-            handle_review_comment.delay(payload)
+            handle_issue_comment.delay(payload)
             return JsonResponse({"status": "queued", "event": "pull_request_review_comment"})
-        return JsonResponse({"status": "ignored", "reason": "not a command"})
+        return JsonResponse({"status": "ignored", "reason": "not a valid command"})
 
     return JsonResponse({"status": "ignored", "event": event})

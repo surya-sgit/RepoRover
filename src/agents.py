@@ -144,7 +144,7 @@ def _build_context_skeleton(repo_files: Dict[str, str], current_file: str) -> st
                         skeleton_lines.append(f"    \"\"\"{ast.get_docstring(node)}\"\"\"")
                     for class_node in node.body:
                         if isinstance(class_node, ast.FunctionDef):
-                            args = [a.arg for class_node in class_node.args.args]
+                            args = [a.arg for a in class_node.args.args] 
                             skeleton_lines.append(f"    def {class_node.name}({', '.join(args)}): pass")
         except SyntaxError:
             skeleton_lines.append("# (Syntax error parsing this file)")
@@ -223,6 +223,7 @@ def call_agent_b(state: AgentState, config=None):
     - DO NOT truncate, use placeholders, or omit any existing logic.
     - DO NOT format the output as a git diff. Just the raw python code.
     - If the code is perfect and there are no errors, return the string "NO_CHANGES".
+    - DO NOT add demonstrative examples, simulated data, or print statements to show how your fix works. Only return the minimal production code.
     """
 
     response = llm.invoke([HumanMessage(content=prompt)])

@@ -68,24 +68,28 @@ class GitHubConnector:
 
     def post_inline_pr_comment(self, pr_number: int, commit_sha: str, file_path: str, body: str) -> int:
         """
-        Attempts to post an inline review comment. Falls back to standard comment if the line position is invalid.
+        Attempts to post an inline review comment. Falls back to standard comment if the API rejects it.
         """
         pr = self.repo.get_pull(pr_number)
         try:
-            # Position 1 targets the first line of the diff patch
+            # FIX: PyGithub requires a Commit object, not just the SHA string
+            commit_obj = self.repo.get_commit(commit_sha) 
+            
+            # Modern PyGithub: Comment at the file-level rather than guessing a line number.
+            # This completely avoids 422 errors if specific lines aren't in the git patch.
             comment = pr.create_review_comment(
                 body=body,
-                commit_id=commit_sha,
+                commit=commit_obj,
                 path=file_path,
-                position=1 
+                subject_type="file"
             )
             return comment.id
+            
         except Exception as e:
-            # Fallback if position=1 is rejected by GitHub API
+            # Fallback if the API rejects the file-level comment
             print(f"Inline comment failed for {file_path}, falling back to PR thread: {e}")
             fallback_body = f"**[Inline notice for `{file_path}`]**\n\n{body}"
             return self.post_pr_comment(pr_number, fallback_body)
-
     def get_latest_commit_sha(self, pr_number: int) -> str:
         """Return the head SHA of a PR, used to guard against stale executions (PRD §4.3)."""
         return self.repo.get_pull(pr_number).head.sha
