@@ -310,8 +310,8 @@ def process_file_review(self, session_id: int, command: str = None, feedback: st
             
             final_vals = updated_snapshot.values
             docs = final_vals.get("documentation", "No documentation generated.")
-            pr_obj = gh.repo.get_pull(pr_number)
-            branch_name = pr_obj.head.ref 
+            pr_data = gh.get_pr_details(pr_number)
+            branch_name = pr_data["head_branch"]
             
             if command == "approve":
                 # PATH 1: Sandbox Verified - Commit Code & Tests
