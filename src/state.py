@@ -1,4 +1,5 @@
-from typing import TypedDict, List, Optional, Dict
+from typing import TypedDict, List, Optional, Dict, Annotated
+from langgraph.graph.message import add_messages
 
 class AgentState(TypedDict):
     # --- Input Context ---
@@ -8,7 +9,8 @@ class AgentState(TypedDict):
     original_code: str
     pr_description: str
     
-    # NEW: Holds the entire relevant file system {"utils.py": "def foo()..."}
+    messages: Annotated[list, add_messages]
+    
     repo_files: Dict[str, str] 
     next_node: str
 
@@ -22,7 +24,7 @@ class AgentState(TypedDict):
     code_diff: Optional[str]
 
     # --- Agent D Artifacts (Conflict Resolution) ---
-    conflict_file_content: Optional[str] # The file with <<<<<<< HEAD markers
+    conflict_file_content: Optional[str]
 
     # --- Executor Artifacts ---
     execution_status: str
@@ -37,7 +39,7 @@ class AgentState(TypedDict):
     # --- Agent T (Test Engineer) Artifacts ---
     existing_test_path: Optional[str]
     existing_test_code: Optional[str]
-    final_test_code: Optional[str]   # The new or modified test suite
+    final_test_code: Optional[str]
     coverage_score: Optional[float]
     pypi_dependencies: List[str]    
 

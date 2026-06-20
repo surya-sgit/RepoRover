@@ -40,7 +40,6 @@ def github_webhook(request):
     secret = settings.GITHUB_WEBHOOK_SECRET
     signature = request.headers.get("X-Hub-Signature-256", "")
 
-    # 1. Authenticate the payload before trusting any of it.
     if not secret or not _signature_valid(secret, request.body, signature):
         return HttpResponse("Invalid signature", status=401)
 
@@ -50,28 +49,44 @@ def github_webhook(request):
     except (ValueError, UnicodeDecodeError):
         return HttpResponseBadRequest("Malformed JSON payload")
 
-    # 2. Routing Engine
+    action = payload.get("action", "unknown")
     
+    # ---------------------------------------------------------
+    # DIAGNOSTIC TRAP: Log all incoming events explicitly
+    # ---------------------------------------------------------
+    if event in ("issue_comment", "pull_request_review_comment"):
+        print(f"\n--- INCOMING WEBHOOK: {event} | ACTION: {action} ---")
+
     # Handles Fresh PR Opens/Syncs
-    if event == "pull_request" and payload.get("action") in ("opened", "synchronize"):
+    if event == "pull_request" and action in ("opened", "synchronize"):
         handle_pull_request.delay(payload)
         return JsonResponse({"status": "queued", "event": "pull_request"})
 
-    # Handles general PR timeline conversation entries (Global)
-    if event == "issue_comment" and payload.get("action") == "created":
+    # Handles general PR timeline conversation entries (Global / Fallbacks)
+    if event == "issue_comment" and action == "created":
         body = payload.get("comment", {}).get("body", "")
         is_pr = "pull_request" in payload.get("issue", {})
-        if is_pr and parse_command(body) is not None:
+        cmd = parse_command(body)
+        
+        print(f"[Issue Comment Check] Is PR: {is_pr} | Parsed Command: {cmd}")
+        
+        if is_pr and cmd is not None:
             handle_issue_comment.delay(payload)
             return JsonResponse({"status": "queued", "event": "issue_comment"})
-        return JsonResponse({"status": "ignored", "reason": "not a valid command"})
+            
+        return JsonResponse({"status": "ignored", "reason": f"is_pr={is_pr}, cmd={cmd}"})
 
     # Handles INLINE file-specific review comments (Granular)
-    if event == "pull_request_review_comment" and payload.get("action") == "created":
+    if event == "pull_request_review_comment" and action == "created":
         body = payload.get("comment", {}).get("body", "")
-        if parse_command(body) is not None:
+        cmd = parse_command(body)
+        
+        print(f"[Inline Comment Check] Parsed Command: {cmd}")
+        
+        if cmd is not None:
             handle_issue_comment.delay(payload)
             return JsonResponse({"status": "queued", "event": "pull_request_review_comment"})
-        return JsonResponse({"status": "ignored", "reason": "not a valid command"})
+            
+        return JsonResponse({"status": "ignored", "reason": f"cmd={cmd}"})
 
     return JsonResponse({"status": "ignored", "event": event})

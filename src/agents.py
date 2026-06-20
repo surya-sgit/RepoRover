@@ -7,7 +7,7 @@ import ast
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from src.state import AgentState
 from e2b_code_interpreter import Sandbox
 
@@ -335,16 +335,27 @@ def call_executor(state: AgentState, config=None):
                 failure_reason = "TESTS_FAILED: The refactored code broke the tests."
                 next_agent = "refactorer_node" # Send back to Refactorer
 
+            # 🚀 THE FIX: Context Hydration & Stale Test Wipe
             return {
                 "execution_status": "FAILURE",
                 "execution_logs": f"{failure_reason}\n\n{logs}",
+                # 1. Inject the error directly into the LLM's message history
+                "messages": [SystemMessage(content=f"⚠️ SANDBOX FAILURE: {failure_reason}\nLogs:\n{logs}")],
+                # 2. Only wipe tests if we are going back to Agent B to rewrite the source code
+                "final_test_code": "" if next_agent == "refactorer_node" else test_code,
                 "iteration_count": current_count + 1,
-                "next_node": next_agent  # <--- Explicitly say where to go
+                "next_node": next_agent 
             }
 
     except Exception as e:
-        return {"execution_status": "FAILURE", "execution_logs": str(e), "next_node": "refactorer_node"}
-
+        # Catch-all crash handler
+        return {
+            "execution_status": "FAILURE", 
+            "execution_logs": str(e), 
+            "messages": [SystemMessage(content=f"⚠️ SANDBOX CRASHED:\n{str(e)}")],
+            "final_test_code": "",
+            "next_node": "refactorer_node"
+        }
 
 # --- 6. Agent C: Documenter ---
 def call_agent_c(state: AgentState, config=None):

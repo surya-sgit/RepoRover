@@ -24,6 +24,7 @@ from engine.errors import (
     extract_diagnostic,
     execution_paused_comment,
 )
+from langchain_core.messages import HumanMessage
 from engine.github_comments import render_review_comment, render_final_comment, BOT_MARKER
 from engine.slash import parse_command, APPROVE, REJECT, SKIP
 from tenancy.models import OrganizationConfig, RepoSettings, ReviewSession
@@ -228,9 +229,12 @@ def process_file_review(self, session_id: int, command: str = None, feedback: st
             }
             
             for _ in app.stream(initial_state, config=config): pass
+
+            session.current_status = ReviewSession.Status.AWAITING_HUMAN
+            session.save(update_fields=["current_status", "updated_at"])
             _report_pause(gh, session, app, config, filename)
             
-            # CRITICAL: Return here so it does not fall into Phase 2
+            # CRITICAL: Return here so it does not fall into Phase 2 on initial run
             return
 
         # ===================================================================
@@ -263,11 +267,14 @@ def process_file_review(self, session_id: int, command: str = None, feedback: st
             app.update_state(config, {"execution_status": "APPROVED"}, as_node="executor_tool_node")
 
         elif command == "reject":
+            # 🚀 FIX: Inject human feedback, wipe stale tests, and explicitly route back to refactorer
             app.update_state(
                 config,
                 {
                     "execution_status": "FAILURE",
                     "execution_logs": f"HUMAN REJECTION: {feedback}",
+                    "messages": [HumanMessage(content=f"User manually rejected the code. Feedback: {feedback}")],
+                    "final_test_code": "", 
                     "iteration_count": snapshot.values.get("iteration_count", 0),
                     "next_node": "refactorer_node",
                 },
@@ -281,41 +288,73 @@ def process_file_review(self, session_id: int, command: str = None, feedback: st
                 as_node="executor_tool_node",
             )
 
+        # ===================================================================
+        # PHASE 3: STREAM & COMPLETE
+        # ===================================================================
         # Stream resumption through the rest of the node graph steps
         for _ in app.stream(None, config=config): pass
 
         # Re-evaluate final state status context
         updated_snapshot = app.get_state(config)
+        
         if updated_snapshot.values.get("next_node") == "refactorer_node" or updated_snapshot.next:
-            session.current_status = 'AWAITING_HUMAN'
+            # 🔄 LOOP-BACK PATH (Sandbox failure or manual /reject)
+            session.current_status = ReviewSession.Status.AWAITING_HUMAN
             session.save(update_fields=["current_status", "updated_at"])
             _report_pause(gh, session, app, config, filename)
+            
         else:
+            # 🏁 FINAL COMPLETION PATH (Success or Skip)
             session.current_status = 'COMPLETED'
             session.save(update_fields=["current_status", "updated_at"])
+            
+            final_vals = updated_snapshot.values
+            docs = final_vals.get("documentation", "No documentation generated.")
+            pr_obj = gh.repo.get_pull(pr_number)
+            branch_name = pr_obj.head.ref 
+            
+            if command == "approve":
+                # PATH 1: Sandbox Verified - Commit Code & Tests
+                gh.push_commit(
+                    branch=branch_name, 
+                    path=final_vals["file_path"], 
+                    content=final_vals.get("refactored_code", ""), 
+                    message=f"RepoRover: Applied sandbox-verified refactor for {filename}"
+                )
+                
+                if final_vals.get("existing_test_path") and final_vals.get("final_test_code"):
+                    gh.push_commit(
+                        branch=branch_name,
+                        path=final_vals["existing_test_path"],
+                        content=final_vals["final_test_code"],
+                        message=f"RepoRover: Updated tests for {filename}"
+                    )
+                
+                gh.post_pr_comment(
+                    pr_number, 
+                    f"{BOT_MARKER}\n✅ **Sandbox Verification Successful!**\n\nCode and tests cleanly committed to `{branch_name}`.\n\n### Documentation:\n{docs}"
+                )
+                
+            elif command == "skip":
+                # PATH 2: Fast-Tracked (Sandbox Skipped) - Commit Code Only
+                gh.push_commit(
+                    branch=branch_name, 
+                    path=final_vals["file_path"], 
+                    content=final_vals.get("refactored_code", ""), 
+                    message=f"RepoRover: Applied trusted refactor for {filename} (Sandbox Skipped)"
+                )
+                
+                gh.post_pr_comment(
+                    pr_number, 
+                    f"{BOT_MARKER}\n⚡ **Refactor Applied via Trusted Path (Sandbox Skipped)!**\n\nCode cleanly committed to `{branch_name}`.\n\n### Documentation:\n{docs}"
+                )
 
     except Exception as exc: 
         _handle_failure(gh, session, pr_number, exc)
-
 # --------------------------------------------------------------------------- #
 # Issue comment -> resume a paused review along a slash-command path
 # --------------------------------------------------------------------------- #
 
-def parse_command(body: str):
-    """
-    Parses commands while ignoring GitHub quote-replies (lines starting with '>').
-    Returns a tuple of (command_name, feedback_string).
-    """
-    clean_lines = [line.strip() for line in body.split('\n') if not line.strip().startswith('>')]
-    clean_text = '\n'.join(clean_lines).strip()
-    
-    if not clean_text:
-        return None, None
-        
-    match = re.search(r'^/(approve|reject|resolve|skip|commit_merge|review)(?:\s+(.*))?', clean_text, re.IGNORECASE | re.DOTALL | re.MULTILINE)
-    if match:
-        return match.group(1).lower(), (match.group(2) or "").strip()
-    return None, None
 
 @shared_task(bind=True)
 def handle_issue_comment(self, payload: dict):
@@ -323,24 +362,37 @@ def handle_issue_comment(self, payload: dict):
     if payload.get("action") != "created":
         return
         
-    pr_number = payload.get("issue", {}).get("number") or payload.get("pull_request", {}).get("number")
-    if not pr_number:
+    # 1. Universal PR Number Extraction (Handles both timeline and inline payloads)
+    if "pull_request" in payload:
+        pr_number = payload["pull_request"]["number"]
+    elif "issue" in payload:
+        pr_number = payload["issue"]["number"]
+    else:
+        print("[-] Aborting: Could not find PR number in webhook payload.")
         return
         
-    body = payload["comment"].get("body", "")
+    comment_data = payload.get("comment", {})
+    body = comment_data.get("body", "")
     
     # Ignore webhooks triggered by bots/apps to prevent infinite loops
     sender_type = payload.get("sender", {}).get("type", "")
     if sender_type == "Bot":
         return  
 
-    cmd_name, feedback = parse_command(body)
+    # 2. Command Extraction
+    cmd = parse_command(body)
+    if not cmd:
+        return
     
-    # --- TEMPORARY DEBUGGING PRINT ---
+    # We now strictly use the SlashCommand object from slash.py!
+    cmd_name = cmd.command
+    feedback = cmd.feedback
+
     print(f"DEBUG: Extracted Command -> {cmd_name} | Feedback -> {feedback}")
     if not cmd_name:
-        return  
+        return
 
+    # 3. Tenant & Repo Setup
     installation_id = payload["installation"]["id"]
     repo_full_name = payload["repository"]["full_name"]
 
@@ -350,11 +402,11 @@ def handle_issue_comment(self, payload: dict):
 
     gh = services.build_connector(org, repo)
 
-    # 1. Context Scoping
+    # 4. Context Scoping
     is_inline = "comment" in payload and "path" in payload["comment"]
     inline_file = payload["comment"]["path"] if is_inline else None
 
-    # 2. Handle Fresh Workflow Intercepts First
+    # 5. Handle Fresh Workflow Intercepts First
     if cmd_name == "review":
         if services.at_capacity(repo):
             gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nRepo is currently at concurrency loop capacity limit.")
@@ -376,20 +428,28 @@ def handle_issue_comment(self, payload: dict):
         gh.post_pr_comment(pr_number, f"{BOT_MARKER}\nThe `/commit_merge` command must be executed directly inside an inline conflict thread.")
         return
 
-    # 3. Target Pending Sessions
+    # 6. Target Pending Sessions
+    print(f"[Debug] Searching DB -> PR: {pr_number} | File: {inline_file} | Status: AWAITING_HUMAN")
+    
     if is_inline:
         sessions = ReviewSession.objects.filter(
-            repo_settings=repo, pr_number=pr_number, file_path=inline_file, current_status='AWAITING_HUMAN'
+            repo_settings=repo, 
+            pr_number=pr_number, 
+            file_path=inline_file, 
+            current_status=ReviewSession.Status.AWAITING_HUMAN
         )
     else:
         sessions = ReviewSession.objects.filter(
-            repo_settings=repo, pr_number=pr_number, current_status='AWAITING_HUMAN'
+            repo_settings=repo, 
+            pr_number=pr_number, 
+            current_status=ReviewSession.Status.AWAITING_HUMAN
         )
 
     if not sessions.exists():
+        print(f"DEBUG: No AWAITING_HUMAN sessions found for PR {pr_number} (File: {inline_file})!")
         return
 
-    # 4. Enforce Stale Commit Check Across All Target Sessions
+    # 7. Enforce Stale Commit Check Across All Target Sessions
     try:
         latest_sha = gh.get_latest_commit_sha(pr_number)
     except Exception:
@@ -406,7 +466,7 @@ def handle_issue_comment(self, payload: dict):
 
     session_count = sessions.count()
 
-    # 5. Enforce Global Rejection Feedback Rule
+    # 8. Enforce Global Rejection Feedback Rule
     if cmd_name == "reject" and not is_inline and session_count > 1:
         feedback_lines = [line for line in feedback.split('\n') if line.strip()]
         if len(feedback_lines) < session_count:
@@ -416,13 +476,16 @@ def handle_issue_comment(self, payload: dict):
             )
             return
 
-    # 6. Process Valid Sessions Loop
-    # Perform a single bulk database update to avoid gevent socket collisions
-    sessions.update(current_status='EXECUTING')
+    # 9. Process Valid Sessions Loop
+    # 🚀 CRITICAL FIX: Evaluate the QuerySet into a static list FIRST
+    session_list = list(sessions)
 
-    # Now dispatch the Celery tasks in memory
-    for idx, s in enumerate(sessions):
-        # Distribute parsed feedback if bulk rejecting
+    # Now it is safe to perform the bulk database update
+    sessions.update(current_status='EXECUTING')
+    print(f"[+] Found {len(session_list)} matching session(s)! Triggering Graph Phase 2...")
+
+    # Iterate over the static list in memory, not the database query
+    for idx, s in enumerate(session_list):
         current_feedback = feedback
         if cmd_name == "reject" and not is_inline and session_count > 1:
             current_feedback = feedback_lines[idx]
