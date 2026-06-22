@@ -92,19 +92,23 @@ cd reporover
 
 ### 2. Install Dependencies
 
+This project uses `uv` for dependency management. Install the dependencies by running:
+
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+*(To include development dependencies, use `uv sync --extra dev`)*
 
 ### 3. Configure Environment Variables
 
-Create a `.env` file in the project root directory with the following contents:
+Copy the provided example configuration file and fill in the required values:
 
-```env
-GITHUB_TOKEN=ghp_your_github_token_here
-E2B_API_KEY=e2b_your_api_key_here
-GOOGLE_API_KEY=your_gemini_api_key_here
+```bash
+cp .env.example .env
 ```
+
+*Note: For the local CLI smoke test, you must uncomment and set `GITHUB_TOKEN`, `E2B_API_KEY`, and `GOOGLE_API_KEY` in the `.env` file. The SaaS platform has additional requirements (detailed below).*
 
 ---
 
@@ -147,7 +151,7 @@ interaction happens inside PR comments via slash commands. The single-PR CLI in
 ### Setup
 
 ```bash
-pip install -r requirements.txt
+uv sync
 cp .env.example .env          # then fill in every value
 # Generate the BYOK master key and paste it into FERNET_KEY:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
